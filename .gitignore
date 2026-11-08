@@ -1,0 +1,20 @@
+# Секреты и конфигурация окружения
+.env
+.env.*
+!.env.example
+
+# SSH ключи и сертификаты
+ssh-key*
+*.pem
+*.key
+*.ppk
+id_rsa*
+id_ed25519*
+
+# Сборка и зависимости
+node_modules/
+frontend/dist/
+backend/server
+*.exe
+*.log
+.DS_Store

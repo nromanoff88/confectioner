@@ -1,0 +1,4 @@
+{$DOMAIN:84-201-128-158.sslip.io} {
+    encode gzip
+    reverse_proxy frontend:80
+}
