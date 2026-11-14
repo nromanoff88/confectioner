@@ -21,9 +21,8 @@ func main() {
 	defer stop()
 
 	cfg := config.Load()
-	log.Printf("[Confectioner CRM] Starting server on :%s (DEV_MODE=%v)", cfg.Port, cfg.DevMode)
+	log.Printf("[Confectioner CRM] Starting server on :%s (DEV_MODE=%v, REGISTRATION_OPEN=%v)", cfg.Port, cfg.DevMode, cfg.RegistrationOpen)
 
-	// Connect to PostgreSQL with retry
 	var store *db.Store
 	var err error
 	for attempt := 1; attempt <= 15; attempt++ {
@@ -43,7 +42,6 @@ func main() {
 	}
 	defer store.Close()
 
-	// Connect to S3 (MinIO) with retry
 	var s3 *storage.S3Storage
 	for attempt := 1; attempt <= 15; attempt++ {
 		s3, err = storage.NewS3Storage(ctx, cfg)
@@ -61,25 +59,16 @@ func main() {
 		log.Fatalf("[S3] Failed to initialize S3 storage: %v", err)
 	}
 
-	if cfg.DevMode && cfg.MaxBotToken == "" {
-		if err := store.SeedDemoData(ctx, s3); err != nil {
-			log.Printf("[Seed] Warning seeding demo data: %v", err)
-		} else {
-			log.Printf("[Seed] Demo clients, messages, and S3 cake photos ready")
-		}
-	}
-
-	hub := api.NewSSEHub()
-
 	botClient, err := bot.NewClient(cfg)
 	if err != nil {
 		log.Fatalf("[MAX Bot] Failed to initialize MAX client: %v", err)
 	}
 
-	botService := bot.NewService(cfg, botClient, store, s3, hub)
+	botService := bot.NewService(cfg, botClient, store)
 	go botService.StartPolling(ctx)
+	go botService.StartReminders(ctx)
 
-	srv := api.NewServer(cfg, store, s3, botService, hub)
+	srv := api.NewServer(cfg, store, s3, botService)
 	httpServer := &http.Server{
 		Addr:              ":" + cfg.Port,
 		Handler:           srv.Handler(),
@@ -100,4 +89,3 @@ func main() {
 	defer cancel()
 	_ = httpServer.Shutdown(shutdownCtx)
 }
-

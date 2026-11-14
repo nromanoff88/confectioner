@@ -1,478 +1,415 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { api } from './api/client';
+import { getStartParam, triggerHapticImpact, triggerHapticSuccess } from './api/bridge';
 import {
-  getMaxInitData,
-  getStartParam,
-  triggerHapticImpact,
-  triggerHapticSuccess,
-} from './api/bridge';
-import {
-  Attachment,
   Client,
+  ClientDetails,
+  ClientInput,
   clientDisplayName,
-  DeliveryType,
-  Message,
   Order,
+  OrderInput,
   OrderStatus,
-  PaymentStatus,
 } from './types';
-import { ChatList } from './components/ChatList';
-import { ChatWindow } from './components/ChatWindow';
+import { ClientList } from './components/ClientList';
 import { ClientCard } from './components/ClientCard';
+import { NotesPanel } from './components/NotesPanel';
 import { ActiveOrderPanel } from './components/ActiveOrderPanel';
 import { OrderHistoryPanel } from './components/OrderHistoryPanel';
+import { CalendarView } from './components/CalendarView';
+import { StatsView } from './components/StatsView';
+import { TeamView } from './components/TeamView';
 import { LightboxModal } from './components/LightboxModal';
 
-type MobileScreen = 'list' | 'chat' | 'details';
-type DetailsTab = 'active_order' | 'profile' | 'history';
+type Tab = 'clients' | 'calendar' | 'stats' | 'team';
+type DetailTab = 'order' | 'profile' | 'notes' | 'history';
 
 export const App: React.FC = () => {
+  const [workspaceName, setWorkspaceName] = useState('');
+  const [authError, setAuthError] = useState('');
+  const [ready, setReady] = useState(false);
+
+  const [tab, setTab] = useState<Tab>('clients');
   const [clients, setClients] = useState<Client[]>([]);
-  const [selectedClientId, setSelectedClientId] = useState<number | null>(null);
-  const [selectedClient, setSelectedClient] = useState<Client | null>(null);
-  const [messages, setMessages] = useState<Message[]>([]);
-  const [activeOrder, setActiveOrder] = useState<Order | null>(null);
-  const [orderHistory, setOrderHistory] = useState<Order[]>([]);
-
+  const [allTags, setAllTags] = useState<string[]>([]);
   const [search, setSearch] = useState('');
-  const [filter, setFilter] = useState<'all' | 'unread' | 'active_order'>('all');
-  const [mobileScreen, setMobileScreen] = useState<MobileScreen>('list');
-  const [detailsTab, setDetailsTab] = useState<DetailsTab>('active_order');
+  const [tag, setTag] = useState('');
 
-  const [devMode, setDevMode] = useState(true);
-  const [botConfigured, setBotConfigured] = useState(false);
-  const [toastMsg, setToastMsg] = useState<string | null>(null);
+  const [selectedId, setSelectedId] = useState<number | null>(null);
+  const [details, setDetails] = useState<ClientDetails | null>(null);
+  const [detailTab, setDetailTab] = useState<DetailTab>('order');
+  const [mobileView, setMobileView] = useState<'list' | 'details'>('list');
+
+  const [activeOrders, setActiveOrders] = useState<Order[]>([]);
+  const [ordersLoading, setOrdersLoading] = useState(false);
+
+  const [openNewClient, setOpenNewClient] = useState(false);
+  const [startCreatingOrder, setStartCreatingOrder] = useState(false);
+  const pendingNewOrder = useRef(false);
+
+  const [toast, setToast] = useState<string | null>(null);
   const [lightbox, setLightbox] = useState<{ url: string; caption?: string } | null>(null);
 
-  const selectedIdRef = useRef<number | null>(null);
-  selectedIdRef.current = selectedClientId;
-
   const showToast = useCallback((msg: string) => {
-    setToastMsg(msg);
-    setTimeout(() => {
-      setToastMsg((prev) => (prev === msg ? null : prev));
-    }, 3200);
+    setToast(msg);
+    setTimeout(() => setToast((prev) => (prev === msg ? null : prev)), 3200);
   }, []);
 
-  const loadClients = useCallback(async (q = search, f = filter) => {
+  const loadClients = useCallback(async (q: string, t: string) => {
     try {
-      const list = await api.listClients(q, f);
+      const list = await api.listClients(q, t);
       setClients(list);
-      return list;
+      if (!q && !t) {
+        setAllTags(Array.from(new Set(list.flatMap((c) => c.tags))).sort((a, b) => a.localeCompare(b, 'ru')));
+      }
     } catch (err) {
       console.error('loadClients error:', err);
-      return [];
-    }
-  }, [search, filter]);
-
-  const loadClientFull = useCallback(async (clientId: number) => {
-    try {
-      const [details, msgs] = await Promise.all([
-        api.getClientDetails(clientId),
-        api.listMessages(clientId),
-      ]);
-      setSelectedClient(details.client);
-      setActiveOrder(details.active_order || null);
-      setOrderHistory(details.history || []);
-      setMessages(msgs);
-    } catch (err) {
-      console.error('loadClientFull error:', err);
     }
   }, []);
 
-  // Initial load + deep link handling (startapp=client_123)
+  const loadDetails = useCallback(async (id: number) => {
+    try {
+      setDetails(await api.getClientDetails(id));
+    } catch (err) {
+      console.error('loadDetails error:', err);
+      setDetails(null);
+    }
+  }, []);
+
+  const loadActiveOrders = useCallback(async () => {
+    setOrdersLoading(true);
+    try {
+      setActiveOrders(await api.listActiveOrders());
+    } catch (err) {
+      console.error('loadActiveOrders error:', err);
+    } finally {
+      setOrdersLoading(false);
+    }
+  }, []);
+
+  const selectClient = useCallback(
+    (id: number, preferTab?: DetailTab) => {
+      setSelectedId(id);
+      setDetailTab(preferTab || 'order');
+      setMobileView('details');
+      if (pendingNewOrder.current) {
+        pendingNewOrder.current = false;
+        setStartCreatingOrder(true);
+      }
+      void loadDetails(id);
+    },
+    [loadDetails]
+  );
+
+  // Initial load: identify the confectioner, then route the deep link (startapp=...)
   useEffect(() => {
     void (async () => {
       try {
-        const health = await api.getHealth();
-        setDevMode(health.dev_mode);
-        setBotConfigured(health.bot_configured);
-      } catch {
-        // ignore
+        const me = await api.getMe();
+        setWorkspaceName(me.workspace_name);
+      } catch (err) {
+        setAuthError(err instanceof Error ? err.message : 'Ошибка авторизации');
+        setReady(true);
+        return;
       }
+      await loadClients('', '');
+      setReady(true);
 
-      const list = await loadClients('', 'all');
-      const startParam = getStartParam();
-      if (startParam.startsWith('client_')) {
-        const targetId = parseInt(startParam.replace('client_', ''), 10);
-        if (!isNaN(targetId)) {
-          setSelectedClientId(targetId);
-          setMobileScreen('chat');
-          void loadClientFull(targetId);
-          return;
-        }
-      }
-      if (list.length > 0 && window.innerWidth >= 960) {
-        setSelectedClientId(list[0].id);
-        void loadClientFull(list[0].id);
+      const start = getStartParam();
+      if (start === 'new_client') {
+        setOpenNewClient(true);
+      } else if (start === 'new_order') {
+        pendingNewOrder.current = true;
+        showToast('Выберите клиента (или запишите нового), чтобы создать заказ');
+      } else if (start === 'orders_today') {
+        setTab('calendar');
+      } else if (start.startsWith('client_')) {
+        const id = parseInt(start.replace('client_', ''), 10);
+        if (!isNaN(id)) selectClient(id);
       }
     })();
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Reload client list when search or filter changes
   useEffect(() => {
-    const timer = setTimeout(() => {
-      void loadClients(search, filter);
-    }, 180);
+    if (!ready || authError) return;
+    const timer = setTimeout(() => void loadClients(search, tag), 180);
     return () => clearTimeout(timer);
-  }, [search, filter, loadClients]);
+  }, [search, tag, ready, authError, loadClients]);
 
-  // MAX Bridge BackButton integration on mobile screens
+  useEffect(() => {
+    if (tab === 'calendar') void loadActiveOrders();
+  }, [tab, loadActiveOrders]);
+
+  // MAX Bridge back button: details -> list
   useEffect(() => {
     const bb = window.WebApp?.BackButton;
     if (!bb) return;
-
-    const handleBack = () => {
-      if (mobileScreen === 'details') {
-        setMobileScreen('chat');
-      } else if (mobileScreen === 'chat') {
-        setMobileScreen('list');
-      }
-    };
-
-    if (mobileScreen !== 'list') {
+    const handleBack = () => setMobileView('list');
+    if (tab === 'clients' && mobileView === 'details') {
       bb.show();
       bb.onClick(handleBack);
     } else {
       bb.hide();
     }
+    return () => bb.offClick(handleBack);
+  }, [tab, mobileView]);
 
-    return () => {
-      bb.offClick(handleBack);
-    };
-  }, [mobileScreen]);
+  const refresh = useCallback(
+    async (id: number | null = selectedId) => {
+      await loadClients(search, tag);
+      if (id) await loadDetails(id);
+    },
+    [selectedId, search, tag, loadClients, loadDetails]
+  );
 
-  // Real-time Server-Sent Events (SSE) subscription
-  useEffect(() => {
-    const initData = getMaxInitData();
-    const url = initData
-      ? `/api/events?init_data=${encodeURIComponent(initData)}`
-      : '/api/events';
+  // ----- Client actions -----
 
-    const es = new EventSource(url);
-    es.onmessage = (evt) => {
-      try {
-        const parsed = JSON.parse(evt.data);
-        if (parsed.type === 'new_message') {
-          const { client, message } = parsed.payload as {
-            client: Client;
-            message: Message;
-          };
-          void loadClients();
-          if (selectedIdRef.current === client.id) {
-            setSelectedClient(client);
-            setMessages((prev) => {
-              if (prev.some((m) => m.id === message.id)) return prev;
-              return [...prev, message];
-            });
-          } else if (message.sender_type === 'client') {
-            showToast(`📩 Новое сообщение от ${clientDisplayName(client)}`);
-          }
-        } else if (parsed.type === 'client_updated') {
-          const updated = parsed.payload as Client;
-          void loadClients();
-          if (selectedIdRef.current === updated.id) {
-            setSelectedClient(updated);
-          }
-        } else if (parsed.type === 'order_updated') {
-          const ord = parsed.payload as Order;
-          void loadClients();
-          if (selectedIdRef.current === ord.client_id) {
-            void loadClientFull(ord.client_id);
-          }
-        }
-      } catch {
-        // ignore ping or malformed events
-      }
-    };
-
-    return () => {
-      es.close();
-    };
-  }, [loadClients, loadClientFull, showToast]);
-
-  const handleSelectClient = (client: Client) => {
-    triggerHapticImpact('light');
-    setSelectedClientId(client.id);
-    setSelectedClient(client);
-    setMobileScreen('chat');
-    void loadClientFull(client.id);
-  };
-
-  const handleCreateClient = async (data: {
-    custom_name: string;
-    phone: string;
-    address: string;
-    description: string;
-  }) => {
+  const handleCreateClient = async (data: ClientInput) => {
     const created = await api.createClient(data);
-    await loadClients();
-    setSelectedClientId(created.id);
-    setSelectedClient(created);
-    setMobileScreen('chat');
-    await loadClientFull(created.id);
+    await loadClients(search, tag);
     triggerHapticSuccess();
-    showToast(`✅ Клиент ${clientDisplayName(created)} создан`);
+    showToast(`✅ Клиент «${clientDisplayName(created)}» записан`);
+    selectClient(created.id, 'order');
   };
 
-  const handleSendMessage = async (text: string, file?: File | null) => {
-    if (!selectedClientId) return;
-    const msg = await api.sendMessage(selectedClientId, text, file);
-    setMessages((prev) => (prev.some((m) => m.id === msg.id) ? prev : [...prev, msg]));
-    triggerHapticImpact('soft');
-    void loadClients();
-  };
-
-  const handleSimulateIncoming = async () => {
-    if (!selectedClientId) return;
-    await api.simulateClientMessage(
-      selectedClientId,
-      'Подскажите, пожалуйста, а можно сделать надпись золотым шоколадом? ✨'
-    );
-  };
-
-  const handleAttachPhotoToOrder = async (
-    att: Attachment,
-    kind: 'reference' | 'result'
-  ) => {
-    if (!selectedClientId || !selectedClient) return;
-    let targetOrder = activeOrder;
-
-    // If the client doesn't have an active order yet, create one automatically!
-    if (!targetOrder) {
-      targetOrder = await api.saveOrder(selectedClientId, {
-        status: 'new',
-        cake_description: 'Новый заказ (создан из фото в чате)',
-        filling: '',
-        decor_inscription: '',
-        weight_kg: 2.0,
-        price: 0,
-        prepayment: 0,
-        payment_status: 'unpaid',
-        delivery_type: selectedClient.address ? 'delivery' : 'pickup',
-        delivery_address: selectedClient.address || '',
-        delivery_date: '',
-      });
-    }
-
-    await api.attachChatPhotoToOrder(
-      targetOrder.id,
-      kind,
-      att.s3_key,
-      att.url,
-      kind === 'reference' ? 'Референс из чата' : 'Готовый торт из чата'
-    );
-    await loadClientFull(selectedClientId);
+  const handleSaveClient = async (data: ClientInput) => {
+    if (!selectedId) return;
+    await api.updateClient(selectedId, data);
+    await refresh();
     triggerHapticSuccess();
-    showToast(
-      kind === 'reference'
-        ? '📌 Фото прикреплено в референсы заказа!'
-        : '🎂 Фото прикреплено как готовый торт!'
-    );
   };
 
-  const handleSaveProfile = async (data: {
-    custom_name: string;
-    phone: string;
-    address: string;
-    description: string;
-  }) => {
-    if (!selectedClientId) return;
-    const updated = await api.updateClientProfile(selectedClientId, data);
-    setSelectedClient(updated);
+  const handleDeleteClient = async () => {
+    if (!selectedId) return;
+    await api.deleteClient(selectedId);
+    setSelectedId(null);
+    setDetails(null);
+    setMobileView('list');
+    await loadClients(search, tag);
+    showToast('Клиент удалён');
+  };
+
+  const handleAddNote = async (text: string) => {
+    if (!selectedId) return;
+    await api.addNote(selectedId, text);
+    await loadDetails(selectedId);
+  };
+
+  const handleDeleteNote = async (noteId: number) => {
+    if (!selectedId) return;
+    await api.deleteNote(noteId);
+    await loadDetails(selectedId);
+  };
+
+  // ----- Order actions -----
+
+  const handleSaveOrder = async (payload: OrderInput) => {
+    if (!selectedId) return;
+    await api.saveOrder(selectedId, payload);
+    await refresh();
     triggerHapticSuccess();
-    void loadClients();
   };
 
-  const handleSaveOrder = async (payload: {
-    id?: number;
-    status: OrderStatus;
-    cake_description: string;
-    filling: string;
-    decor_inscription: string;
-    weight_kg: number;
-    price: number;
-    prepayment: number;
-    payment_status: PaymentStatus;
-    delivery_type: DeliveryType;
-    delivery_address: string;
-    delivery_date: string;
-  }) => {
-    if (!selectedClientId) return;
-    await api.saveOrder(selectedClientId, payload);
-    await loadClientFull(selectedClientId);
-    await loadClients();
-    triggerHapticSuccess();
-    showToast('✅ Заказ сохранён');
-  };
-
-  const handleChangeOrderStatus = async (orderId: number, status: OrderStatus) => {
-    if (!selectedClientId) return;
+  const handleChangeStatus = async (orderId: number, status: OrderStatus) => {
+    if (!selectedId) return;
     await api.updateOrderStatus(orderId, status);
-    await loadClientFull(selectedClientId);
-    await loadClients();
+    await refresh();
     triggerHapticSuccess();
     if (status === 'completed' || status === 'cancelled') {
-      setDetailsTab('history');
-      showToast('🔔 Статус обновлён и заказ перенесён в историю!');
-    } else {
-      showToast('🔔 Статус обновлён, клиенту отправлено уведомление!');
+      setDetailTab('history');
+      showToast('Заказ перенесён в историю клиента');
     }
   };
 
-  const handleUploadOrderPhoto = async (
-    orderId: number,
-    kind: 'reference' | 'result',
-    file: File
-  ) => {
-    if (!selectedClientId) return;
-    await api.uploadOrderPhoto(orderId, kind, file);
-    await loadClientFull(selectedClientId);
-    triggerHapticSuccess();
-    showToast('📷 Фотография загружена в S3 и прикреплена к заказу!');
+  const handleDeleteOrder = async (orderId: number) => {
+    if (!selectedId) return;
+    await api.deleteOrder(orderId);
+    await refresh();
+    showToast('Заказ удалён');
   };
 
-  const handleDeleteOrderPhoto = async (orderId: number, photoId: number) => {
-    if (!selectedClientId) return;
-    await api.deleteOrderPhoto(orderId, photoId);
-    await loadClientFull(selectedClientId);
-    showToast('Фото удалено из заказа');
+  const handleUploadPhoto = async (orderId: number, kind: 'reference' | 'result', file: File) => {
+    if (!selectedId) return;
+    await api.uploadOrderPhoto(orderId, kind, file);
+    await loadDetails(selectedId);
+    triggerHapticSuccess();
+    showToast('📷 Фото сохранено');
   };
+
+  const handleDeletePhoto = async (orderId: number, photoId: number) => {
+    if (!selectedId) return;
+    await api.deleteOrderPhoto(orderId, photoId);
+    await loadDetails(selectedId);
+  };
+
+  const openClientFromOtherTab = (clientId: number) => {
+    setTab('clients');
+    selectClient(clientId);
+  };
+
+  // ----- Render -----
+
+  if (!ready) {
+    return <div className="page-empty">Загрузка...</div>;
+  }
+  if (authError) {
+    return (
+      <div className="page-empty">
+        <div className="empty-order-icon">🔒</div>
+        <h3>Нет доступа</h3>
+        <p>{authError}</p>
+      </div>
+    );
+  }
+
+  const selected = details?.client || null;
 
   return (
-    <div className={`app-shell mobile-screen-${mobileScreen}`}>
-      {!botConfigured && (
-        <div className="top-status-banner">
-          <span>
-            ℹ️ <strong>Демо/Локальный режим:</strong> Укажите <code>MAX_BOT_TOKEN</code> в файле{' '}
-            <code>.env</code>, чтобы подключить реального бота MAX (<code>platform-api2.max.ru</code>).
-          </span>
-        </div>
-      )}
+    <div className={`app-shell view-${mobileView}`}>
+      <header className="topbar">
+        <div className="topbar-title">🎂 {workspaceName || 'Кондитерская'}</div>
+        <nav className="top-tabs">
+          {(
+            [
+              ['clients', '👥 Клиенты'],
+              ['calendar', '📅 Календарь'],
+              ['stats', '📊 Статистика'],
+              ['team', '🤝 Команда'],
+            ] as [Tab, string][]
+          ).map(([key, label]) => (
+            <button
+              key={key}
+              className={tab === key ? 'active' : ''}
+              onClick={() => {
+                triggerHapticImpact('light');
+                setTab(key);
+              }}
+            >
+              {label}
+            </button>
+          ))}
+        </nav>
+      </header>
 
-      {toastMsg && <div className="floating-toast">{toastMsg}</div>}
+      {toast && <div className="floating-toast">{toast}</div>}
 
-      <div className="workspace-grid">
-        {/* LEFT COLUMN: Client Chats List */}
-        <div className="col-list">
-          <ChatList
-            clients={clients}
-            selectedClientId={selectedClientId}
-            search={search}
-            filter={filter}
-            onSearchChange={setSearch}
-            onFilterChange={setFilter}
-            onSelectClient={handleSelectClient}
-            onCreateClient={handleCreateClient}
-          />
-        </div>
-
-        {/* CENTER COLUMN: Active Chat Window */}
-        <div className="col-chat">
-          {selectedClient ? (
-            <ChatWindow
-              client={selectedClient}
-              messages={messages}
-              activeOrder={activeOrder}
-              devMode={devMode}
-              onBackMobile={() => setMobileScreen('list')}
-              onOpenDetailsMobile={() => setMobileScreen('details')}
-              onSendMessage={handleSendMessage}
-              onSimulateIncoming={handleSimulateIncoming}
-              onAttachPhotoToOrder={handleAttachPhotoToOrder}
-              onPreviewImage={(url, caption) => setLightbox({ url, caption })}
-            />
-          ) : (
-            <div className="no-chat-selected">
-              <div className="no-chat-icon">🎂</div>
-              <h2>Выберите диалог слева</h2>
-              <p>
-                Здесь отобразится переписка с клиентом, его карточка, активный заказ и фотографии
-                тортов из истории заказов.
-              </p>
+      <main className="app-main">
+        {tab === 'clients' && (
+          <div className="crm-grid">
+            <div className="crm-col-list">
+              <ClientList
+                clients={clients}
+                selectedClientId={selectedId}
+                search={search}
+                tag={tag}
+                allTags={allTags}
+                autoOpenNew={openNewClient}
+                onAutoOpenHandled={() => setOpenNewClient(false)}
+                onSearchChange={setSearch}
+                onTagChange={setTag}
+                onSelectClient={(c) => selectClient(c.id)}
+                onCreateClient={handleCreateClient}
+              />
             </div>
-          )}
-        </div>
 
-        {/* RIGHT COLUMN: Client Card, Active Order, Order History */}
-        <div className="col-details">
-          {selectedClient ? (
-            <div className="details-container">
-              <div className="details-mobile-bar">
-                <button
-                  type="button"
-                  className="btn-back-mobile"
-                  onClick={() => setMobileScreen('chat')}
-                >
-                  ← Вернуться в чат
-                </button>
-                <span className="details-mobile-title">{clientDisplayName(selectedClient)}</span>
-              </div>
+            <div className="crm-col-details">
+              {selected && details ? (
+                <div className="details-container">
+                  <div className="details-mobile-bar">
+                    <button type="button" className="btn-back-mobile" onClick={() => setMobileView('list')}>
+                      ← Клиенты
+                    </button>
+                    <span className="details-mobile-title">{clientDisplayName(selected)}</span>
+                  </div>
 
-              <div className="details-tabs">
-                <button
-                  type="button"
-                  className={detailsTab === 'active_order' ? 'active' : ''}
-                  onClick={() => setDetailsTab('active_order')}
-                >
-                  🎂 Активный заказ {activeOrder ? '• 1' : ''}
-                </button>
-                <button
-                  type="button"
-                  className={detailsTab === 'profile' ? 'active' : ''}
-                  onClick={() => setDetailsTab('profile')}
-                >
-                  👤 Клиент
-                </button>
-                <button
-                  type="button"
-                  className={detailsTab === 'history' ? 'active' : ''}
-                  onClick={() => setDetailsTab('history')}
-                >
-                  📚 История ({orderHistory.length})
-                </button>
-              </div>
+                  <div className="details-head">
+                    <h2>{clientDisplayName(selected)}</h2>
+                    {selected.tags.length > 0 && (
+                      <div className="tag-row small">
+                        {selected.tags.map((t) => (
+                          <span key={t} className="tag-chip static">
+                            {t}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
 
-              <div className="details-scroll-body">
-                {detailsTab === 'active_order' && (
-                  <ActiveOrderPanel
-                    client={selectedClient}
-                    order={activeOrder}
-                    onSaveOrder={handleSaveOrder}
-                    onChangeStatus={handleChangeOrderStatus}
-                    onUploadPhoto={handleUploadOrderPhoto}
-                    onDeletePhoto={handleDeleteOrderPhoto}
-                    onPreviewImage={(url, caption) => setLightbox({ url, caption })}
-                  />
-                )}
+                  <div className="details-tabs">
+                    <button
+                      className={detailTab === 'order' ? 'active' : ''}
+                      onClick={() => setDetailTab('order')}
+                    >
+                      🎂 Заказ{details.active_order ? ' •' : ''}
+                    </button>
+                    <button
+                      className={detailTab === 'profile' ? 'active' : ''}
+                      onClick={() => setDetailTab('profile')}
+                    >
+                      👤 Клиент
+                    </button>
+                    <button
+                      className={detailTab === 'notes' ? 'active' : ''}
+                      onClick={() => setDetailTab('notes')}
+                    >
+                      📝 Заметки ({details.notes.length})
+                    </button>
+                    <button
+                      className={detailTab === 'history' ? 'active' : ''}
+                      onClick={() => setDetailTab('history')}
+                    >
+                      📚 История ({details.history.length})
+                    </button>
+                  </div>
 
-                {detailsTab === 'profile' && (
-                  <ClientCard client={selectedClient} onSaveProfile={handleSaveProfile} />
-                )}
-
-                {detailsTab === 'history' && (
-                  <OrderHistoryPanel
-                    history={orderHistory}
-                    onUploadHistoryPhoto={handleUploadOrderPhoto}
-                    onPreviewImage={(url, caption) => setLightbox({ url, caption })}
-                  />
-                )}
-              </div>
+                  <div className="details-scroll-body">
+                    {detailTab === 'order' && (
+                      <ActiveOrderPanel
+                        client={selected}
+                        order={details.active_order}
+                        startCreating={startCreatingOrder}
+                        onCreatingHandled={() => setStartCreatingOrder(false)}
+                        onSaveOrder={handleSaveOrder}
+                        onChangeStatus={handleChangeStatus}
+                        onDeleteOrder={handleDeleteOrder}
+                        onUploadPhoto={handleUploadPhoto}
+                        onDeletePhoto={handleDeletePhoto}
+                        onPreviewImage={(url, caption) => setLightbox({ url, caption })}
+                      />
+                    )}
+                    {detailTab === 'profile' && (
+                      <ClientCard client={selected} onSave={handleSaveClient} onDelete={handleDeleteClient} />
+                    )}
+                    {detailTab === 'notes' && (
+                      <NotesPanel notes={details.notes} onAdd={handleAddNote} onDelete={handleDeleteNote} />
+                    )}
+                    {detailTab === 'history' && (
+                      <OrderHistoryPanel
+                        history={details.history}
+                        onUploadHistoryPhoto={handleUploadPhoto}
+                        onPreviewImage={(url, caption) => setLightbox({ url, caption })}
+                      />
+                    )}
+                  </div>
+                </div>
+              ) : (
+                <div className="no-details-selected">
+                  <div className="no-chat-icon">🎂</div>
+                  <h2>Выберите клиента</h2>
+                  <p>Или запишите нового кнопкой «+ Записать клиента».</p>
+                </div>
+              )}
             </div>
-          ) : (
-            <div className="no-details-selected">
-              <p>Выберите клиента для просмотра карточки и заказов</p>
-            </div>
-          )}
-        </div>
-      </div>
+          </div>
+        )}
 
-      <LightboxModal
-        url={lightbox?.url || null}
-        caption={lightbox?.caption}
-        onClose={() => setLightbox(null)}
-      />
+        {tab === 'calendar' && (
+          <CalendarView orders={activeOrders} loading={ordersLoading} onOpenClient={openClientFromOtherTab} />
+        )}
+        {tab === 'stats' && <StatsView onOpenClient={openClientFromOtherTab} />}
+        {tab === 'team' && <TeamView />}
+      </main>
+
+      <LightboxModal url={lightbox?.url || null} caption={lightbox?.caption} onClose={() => setLightbox(null)} />
     </div>
   );
 };
-

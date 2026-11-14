@@ -2,27 +2,51 @@ package db
 
 import (
 	"context"
-	"encoding/json"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
 
-	"confectioner-backend/internal/storage"
-
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+var ErrNotFound = pgx.ErrNoRows
 
 type Store struct {
 	pool *pgxpool.Pool
 }
 
-type Attachment struct {
-	Type     string `json:"type"`
-	S3Key    string `json:"s3_key"`
-	URL      string `json:"url"`
-	Filename string `json:"filename,omitempty"`
+type scanner interface {
+	Scan(dest ...any) error
+}
+
+// ---------- Types ----------
+
+type Member struct {
+	MaxUserID     int64     `json:"max_user_id"`
+	WorkspaceID   int64     `json:"workspace_id"`
+	WorkspaceName string    `json:"workspace_name"`
+	InviteCode    string    `json:"-"`
+	ChatID        int64     `json:"-"`
+	FirstName     string    `json:"first_name"`
+	LastName      string    `json:"last_name"`
+	Username      string    `json:"username"`
+	Role          string    `json:"role"` // "owner" | "member"
+	CreatedAt     time.Time `json:"created_at"`
+}
+
+func (m Member) DisplayName() string {
+	full := strings.TrimSpace(m.FirstName + " " + m.LastName)
+	if full != "" {
+		return full
+	}
+	if m.Username != "" {
+		return "@" + m.Username
+	}
+	return fmt.Sprintf("Кондитер #%d", m.MaxUserID)
 }
 
 type ActiveOrderBrief struct {
@@ -35,47 +59,27 @@ type ActiveOrderBrief struct {
 }
 
 type Client struct {
-	ID              int64             `json:"id"`
-	MaxUserID       int64             `json:"max_user_id"`
-	MaxChatID       int64             `json:"max_chat_id"`
-	FirstName       string            `json:"first_name"`
-	LastName        string            `json:"last_name"`
-	Username        string            `json:"username"`
-	AvatarURL       string            `json:"avatar_url"`
-	CustomName      string            `json:"custom_name"`
-	Phone           string            `json:"phone"`
-	Address         string            `json:"address"`
-	Description     string            `json:"description"`
-	UnreadCount     int               `json:"unread_count"`
-	LastMessageText string            `json:"last_message_text"`
-	LastMessageAt   time.Time         `json:"last_message_at"`
-	CreatedAt       time.Time         `json:"created_at"`
-	UpdatedAt       time.Time         `json:"updated_at"`
-	ActiveOrder     *ActiveOrderBrief `json:"active_order,omitempty"`
+	ID          int64             `json:"id"`
+	WorkspaceID int64             `json:"workspace_id"`
+	Name        string            `json:"name"`
+	Phone       string            `json:"phone"`
+	Address     string            `json:"address"`
+	Description string            `json:"description"`
+	MaxUsername string            `json:"max_username"`
+	Tags        []string          `json:"tags"`
+	CreatedAt   time.Time         `json:"created_at"`
+	UpdatedAt   time.Time         `json:"updated_at"`
+	ActiveOrder *ActiveOrderBrief `json:"active_order,omitempty"`
+	OrdersCount int               `json:"orders_count"`
+	TotalSpent  float64           `json:"total_spent"`
 }
 
-func (c Client) DisplayName() string {
-	if strings.TrimSpace(c.CustomName) != "" {
-		return strings.TrimSpace(c.CustomName)
-	}
-	full := strings.TrimSpace(c.FirstName + " " + c.LastName)
-	if full != "" {
-		return full
-	}
-	if c.Username != "" {
-		return "@" + c.Username
-	}
-	return fmt.Sprintf("Клиент #%d", c.ID)
-}
-
-type Message struct {
-	ID          int64        `json:"id"`
-	ClientID    int64        `json:"client_id"`
-	MaxMID      string       `json:"max_mid"`
-	SenderType  string       `json:"sender_type"` // "client" | "operator" | "system"
-	Text        string       `json:"text"`
-	Attachments []Attachment `json:"attachments"`
-	CreatedAt   time.Time    `json:"created_at"`
+type Note struct {
+	ID         int64     `json:"id"`
+	ClientID   int64     `json:"client_id"`
+	AuthorName string    `json:"author_name"`
+	Text       string    `json:"text"`
+	CreatedAt  time.Time `json:"created_at"`
 }
 
 type OrderPhoto struct {
@@ -90,23 +94,58 @@ type OrderPhoto struct {
 
 type Order struct {
 	ID               int64        `json:"id"`
+	WorkspaceID      int64        `json:"workspace_id"`
 	ClientID         int64        `json:"client_id"`
-	Status           string       `json:"status"` // "new" | "awaiting_prepayment" | "in_progress" | "ready" | "completed" | "cancelled"
+	ClientName       string       `json:"client_name"`
+	Status           string       `json:"status"`
 	CakeDescription  string       `json:"cake_description"`
 	Filling          string       `json:"filling"`
 	DecorInscription string       `json:"decor_inscription"`
 	WeightKg         float64      `json:"weight_kg"`
 	Price            float64      `json:"price"`
 	Prepayment       float64      `json:"prepayment"`
-	PaymentStatus    string       `json:"payment_status"` // "unpaid" | "prepaid" | "paid"
-	DeliveryType     string       `json:"delivery_type"`  // "pickup" | "delivery"
+	PaymentStatus    string       `json:"payment_status"`
+	DeliveryType     string       `json:"delivery_type"`
 	DeliveryAddress  string       `json:"delivery_address"`
 	DeliveryDate     *time.Time   `json:"delivery_date,omitempty"`
+	RemindBeforeMin  int          `json:"remind_before_min"`
 	Photos           []OrderPhoto `json:"photos"`
 	CreatedAt        time.Time    `json:"created_at"`
 	UpdatedAt        time.Time    `json:"updated_at"`
 	CompletedAt      *time.Time   `json:"completed_at,omitempty"`
 }
+
+type TopClient struct {
+	ClientID int64   `json:"client_id"`
+	Name     string  `json:"name"`
+	Orders   int     `json:"orders"`
+	Revenue  float64 `json:"revenue"`
+}
+
+type Stats struct {
+	Month           string      `json:"month"`
+	Revenue         float64     `json:"revenue"`
+	OrdersCompleted int         `json:"orders_completed"`
+	WeightKg        float64     `json:"weight_kg"`
+	AvgCheck        float64     `json:"avg_check"`
+	NewClients      int         `json:"new_clients"`
+	ActiveOrders    int         `json:"active_orders"`
+	Outstanding     float64     `json:"outstanding"`
+	TopClients      []TopClient `json:"top_clients"`
+}
+
+type ReminderItem struct {
+	OrderID         int64
+	WorkspaceID     int64
+	ClientName      string
+	CakeDescription string
+	WeightKg        float64
+	DeliveryDate    time.Time
+	DeliveryType    string
+	DeliveryAddress string
+}
+
+// ---------- Setup ----------
 
 func NewStore(ctx context.Context, databaseURL string) (*Store, error) {
 	pool, err := pgxpool.New(ctx, databaseURL)
@@ -128,43 +167,75 @@ func (s *Store) Close() {
 }
 
 func (s *Store) Migrate(ctx context.Context) error {
+	// The first (single-tenant, chat-based) version had no workspace_id. Keep that data
+	// under legacy_* names instead of dropping it.
+	var legacy bool
+	err := s.pool.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'clients')
+		   AND NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'clients' AND column_name = 'workspace_id')
+	`).Scan(&legacy)
+	if err != nil {
+		return err
+	}
+	if legacy {
+		if _, err := s.pool.Exec(ctx, `
+			ALTER TABLE order_photos RENAME TO legacy_order_photos;
+			ALTER TABLE orders RENAME TO legacy_orders;
+			ALTER TABLE messages RENAME TO legacy_messages;
+			ALTER TABLE clients RENAME TO legacy_clients;
+		`); err != nil {
+			return fmt.Errorf("archive legacy tables: %w", err)
+		}
+	}
+
 	schema := `
-CREATE TABLE IF NOT EXISTS clients (
+CREATE TABLE IF NOT EXISTS workspaces (
 	id BIGSERIAL PRIMARY KEY,
-	max_user_id BIGINT UNIQUE NOT NULL,
-	max_chat_id BIGINT NOT NULL,
-	first_name TEXT NOT NULL DEFAULT '',
-	last_name TEXT NOT NULL DEFAULT '',
-	username TEXT NOT NULL DEFAULT '',
-	avatar_url TEXT NOT NULL DEFAULT '',
-	custom_name TEXT NOT NULL DEFAULT '',
-	phone TEXT NOT NULL DEFAULT '',
-	address TEXT NOT NULL DEFAULT '',
-	description TEXT NOT NULL DEFAULT '',
-	unread_count INT NOT NULL DEFAULT 0,
-	last_message_text TEXT NOT NULL DEFAULT '',
-	last_message_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-	updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_clients_max_chat_id ON clients(max_chat_id);
-CREATE INDEX IF NOT EXISTS idx_clients_last_message_at ON clients(last_message_at DESC);
-
-CREATE TABLE IF NOT EXISTS messages (
-	id BIGSERIAL PRIMARY KEY,
-	client_id BIGINT NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
-	max_mid TEXT NOT NULL DEFAULT '',
-	sender_type TEXT NOT NULL,
-	text TEXT NOT NULL DEFAULT '',
-	attachments JSONB NOT NULL DEFAULT '[]'::jsonb,
+	name TEXT NOT NULL,
+	invite_code TEXT UNIQUE NOT NULL,
 	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_messages_client_id_created ON messages(client_id, created_at ASC);
+CREATE TABLE IF NOT EXISTS members (
+	max_user_id BIGINT PRIMARY KEY,
+	workspace_id BIGINT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+	chat_id BIGINT NOT NULL DEFAULT 0,
+	first_name TEXT NOT NULL DEFAULT '',
+	last_name TEXT NOT NULL DEFAULT '',
+	username TEXT NOT NULL DEFAULT '',
+	role TEXT NOT NULL DEFAULT 'member',
+	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_members_ws ON members(workspace_id);
+
+CREATE TABLE IF NOT EXISTS clients (
+	id BIGSERIAL PRIMARY KEY,
+	workspace_id BIGINT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+	name TEXT NOT NULL DEFAULT '',
+	phone TEXT NOT NULL DEFAULT '',
+	address TEXT NOT NULL DEFAULT '',
+	description TEXT NOT NULL DEFAULT '',
+	max_username TEXT NOT NULL DEFAULT '',
+	tags TEXT[] NOT NULL DEFAULT '{}',
+	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_clients_ws ON clients(workspace_id);
+
+CREATE TABLE IF NOT EXISTS client_notes (
+	id BIGSERIAL PRIMARY KEY,
+	client_id BIGINT NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
+	workspace_id BIGINT NOT NULL,
+	author_id BIGINT NOT NULL DEFAULT 0,
+	author_name TEXT NOT NULL DEFAULT '',
+	text TEXT NOT NULL,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_notes_client ON client_notes(client_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS orders (
 	id BIGSERIAL PRIMARY KEY,
+	workspace_id BIGINT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
 	client_id BIGINT NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
 	status TEXT NOT NULL DEFAULT 'new',
 	cake_description TEXT NOT NULL DEFAULT '',
@@ -177,12 +248,15 @@ CREATE TABLE IF NOT EXISTS orders (
 	delivery_type TEXT NOT NULL DEFAULT 'pickup',
 	delivery_address TEXT NOT NULL DEFAULT '',
 	delivery_date TIMESTAMPTZ NULL,
+	remind_before_min INT NOT NULL DEFAULT 120,
+	reminded_at TIMESTAMPTZ NULL,
+	created_by BIGINT NOT NULL DEFAULT 0,
 	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 	updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 	completed_at TIMESTAMPTZ NULL
 );
-
-CREATE INDEX IF NOT EXISTS idx_orders_client_id ON orders(client_id);
+CREATE INDEX IF NOT EXISTS idx_orders_ws_date ON orders(workspace_id, delivery_date);
+CREATE INDEX IF NOT EXISTS idx_orders_client ON orders(client_id);
 
 CREATE TABLE IF NOT EXISTS order_photos (
 	id BIGSERIAL PRIMARY KEY,
@@ -193,8 +267,7 @@ CREATE TABLE IF NOT EXISTS order_photos (
 	caption TEXT NOT NULL DEFAULT '',
 	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-
-CREATE INDEX IF NOT EXISTS idx_order_photos_order_id ON order_photos(order_id);
+CREATE INDEX IF NOT EXISTS idx_photos_order ON order_photos(order_id);
 
 CREATE TABLE IF NOT EXISTS bot_state (
 	key TEXT PRIMARY KEY,
@@ -202,7 +275,7 @@ CREATE TABLE IF NOT EXISTS bot_state (
 	updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 `
-	_, err := s.pool.Exec(ctx, schema)
+	_, err = s.pool.Exec(ctx, schema)
 	return err
 }
 
@@ -229,111 +302,191 @@ func (s *Store) SetBotMarker(ctx context.Context, marker int64) error {
 	return err
 }
 
-func (s *Store) UpsertClientFromBot(ctx context.Context, maxUserID, maxChatID int64, firstName, lastName, username, avatarURL string) (*Client, error) {
-	var c Client
-	err := s.pool.QueryRow(ctx, `
-		INSERT INTO clients (max_user_id, max_chat_id, first_name, last_name, username, avatar_url, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, NOW())
-		ON CONFLICT (max_user_id) DO UPDATE SET
-			max_chat_id = CASE WHEN EXCLUDED.max_chat_id != 0 THEN EXCLUDED.max_chat_id ELSE clients.max_chat_id END,
-			first_name = CASE WHEN EXCLUDED.first_name != '' THEN EXCLUDED.first_name ELSE clients.first_name END,
-			last_name = CASE WHEN EXCLUDED.last_name != '' THEN EXCLUDED.last_name ELSE clients.last_name END,
-			username = CASE WHEN EXCLUDED.username != '' THEN EXCLUDED.username ELSE clients.username END,
-			avatar_url = CASE WHEN EXCLUDED.avatar_url != '' THEN EXCLUDED.avatar_url ELSE clients.avatar_url END,
-			updated_at = NOW()
-		RETURNING id, max_user_id, max_chat_id, first_name, last_name, username, avatar_url,
-		          custom_name, phone, address, description, unread_count, last_message_text,
-		          last_message_at, created_at, updated_at
-	`, maxUserID, maxChatID, firstName, lastName, username, avatarURL).Scan(
-		&c.ID, &c.MaxUserID, &c.MaxChatID, &c.FirstName, &c.LastName, &c.Username, &c.AvatarURL,
-		&c.CustomName, &c.Phone, &c.Address, &c.Description, &c.UnreadCount, &c.LastMessageText,
-		&c.LastMessageAt, &c.CreatedAt, &c.UpdatedAt,
-	)
-	if err != nil {
-		return nil, err
-	}
-	return &c, nil
+// ---------- Workspaces & members ----------
+
+func randomCode() string {
+	var b [5]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
 }
 
-func (s *Store) GetClient(ctx context.Context, id int64) (*Client, error) {
-	var c Client
-	err := s.pool.QueryRow(ctx, `
-		SELECT id, max_user_id, max_chat_id, first_name, last_name, username, avatar_url,
-		       custom_name, phone, address, description, unread_count, last_message_text,
-		       last_message_at, created_at, updated_at
-		FROM clients WHERE id = $1
-	`, id).Scan(
-		&c.ID, &c.MaxUserID, &c.MaxChatID, &c.FirstName, &c.LastName, &c.Username, &c.AvatarURL,
-		&c.CustomName, &c.Phone, &c.Address, &c.Description, &c.UnreadCount, &c.LastMessageText,
-		&c.LastMessageAt, &c.CreatedAt, &c.UpdatedAt,
-	)
+const memberSelect = `m.max_user_id, m.workspace_id, w.name, w.invite_code, m.chat_id,
+	m.first_name, m.last_name, m.username, m.role, m.created_at`
+
+func scanMember(row scanner) (*Member, error) {
+	var m Member
+	if err := row.Scan(&m.MaxUserID, &m.WorkspaceID, &m.WorkspaceName, &m.InviteCode, &m.ChatID,
+		&m.FirstName, &m.LastName, &m.Username, &m.Role, &m.CreatedAt); err != nil {
+		return nil, err
+	}
+	return &m, nil
+}
+
+// GetMember returns nil, nil when the user is not registered.
+func (s *Store) GetMember(ctx context.Context, maxUserID int64) (*Member, error) {
+	m, err := scanMember(s.pool.QueryRow(ctx, `
+		SELECT `+memberSelect+`
+		FROM members m JOIN workspaces w ON w.id = m.workspace_id
+		WHERE m.max_user_id = $1`, maxUserID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	return m, err
+}
+
+func (s *Store) ListMembers(ctx context.Context, workspaceID int64) ([]Member, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT `+memberSelect+`
+		FROM members m JOIN workspaces w ON w.id = m.workspace_id
+		WHERE m.workspace_id = $1
+		ORDER BY (m.role = 'owner') DESC, m.created_at ASC`, workspaceID)
 	if err != nil {
 		return nil, err
 	}
-	active, _ := s.GetActiveOrder(ctx, c.ID)
-	if active != nil {
-		c.ActiveOrder = &ActiveOrderBrief{
-			ID:              active.ID,
-			Status:          active.Status,
-			CakeDescription: active.CakeDescription,
-			WeightKg:        active.WeightKg,
-			Price:           active.Price,
-			DeliveryDate:    active.DeliveryDate,
+	defer rows.Close()
+	list := []Member{}
+	for rows.Next() {
+		m, err := scanMember(rows)
+		if err != nil {
+			return nil, err
+		}
+		list = append(list, *m)
+	}
+	return list, rows.Err()
+}
+
+func (s *Store) CreateWorkspaceWithOwner(ctx context.Context, m Member, workspaceName string) (*Member, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	var wsID int64
+	if err := tx.QueryRow(ctx, `INSERT INTO workspaces (name, invite_code) VALUES ($1, $2) RETURNING id`,
+		workspaceName, randomCode()).Scan(&wsID); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO members (max_user_id, workspace_id, chat_id, first_name, last_name, username, role)
+		VALUES ($1, $2, $3, $4, $5, $6, 'owner')
+		ON CONFLICT (max_user_id) DO NOTHING`,
+		m.MaxUserID, wsID, m.ChatID, m.FirstName, m.LastName, m.Username); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return s.GetMember(ctx, m.MaxUserID)
+}
+
+// JoinWorkspaceByCode returns nil, nil when the invite code is unknown.
+func (s *Store) JoinWorkspaceByCode(ctx context.Context, code string, m Member) (*Member, error) {
+	var wsID int64
+	err := s.pool.QueryRow(ctx, `SELECT id FROM workspaces WHERE invite_code = $1`, strings.TrimSpace(strings.ToLower(code))).Scan(&wsID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if _, err := s.pool.Exec(ctx, `
+		INSERT INTO members (max_user_id, workspace_id, chat_id, first_name, last_name, username, role)
+		VALUES ($1, $2, $3, $4, $5, $6, 'member')
+		ON CONFLICT (max_user_id) DO NOTHING`,
+		m.MaxUserID, wsID, m.ChatID, m.FirstName, m.LastName, m.Username); err != nil {
+		return nil, err
+	}
+	return s.GetMember(ctx, m.MaxUserID)
+}
+
+func (s *Store) UpdateMemberChat(ctx context.Context, maxUserID, chatID int64) error {
+	_, err := s.pool.Exec(ctx, `UPDATE members SET chat_id = $2 WHERE max_user_id = $1`, maxUserID, chatID)
+	return err
+}
+
+// RemoveMember removes a non-owner member of the workspace.
+func (s *Store) RemoveMember(ctx context.Context, workspaceID, maxUserID int64) error {
+	tag, err := s.pool.Exec(ctx, `DELETE FROM members WHERE workspace_id = $1 AND max_user_id = $2 AND role <> 'owner'`,
+		workspaceID, maxUserID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ---------- Clients ----------
+
+const clientSelect = `
+	SELECT c.id, c.workspace_id, c.name, c.phone, c.address, c.description, c.max_username, c.tags,
+	       c.created_at, c.updated_at,
+	       ao.id, ao.status, ao.cake_description, ao.weight_kg, ao.price, ao.delivery_date,
+	       COALESCE(st.cnt, 0), COALESCE(st.total, 0)
+	FROM clients c
+	LEFT JOIN LATERAL (
+		SELECT id, status, cake_description, weight_kg, price, delivery_date
+		FROM orders o
+		WHERE o.client_id = c.id AND o.status NOT IN ('completed', 'cancelled')
+		ORDER BY o.created_at DESC
+		LIMIT 1
+	) ao ON TRUE
+	LEFT JOIN LATERAL (
+		SELECT COUNT(*) AS cnt, COALESCE(SUM(price), 0) AS total
+		FROM orders o
+		WHERE o.client_id = c.id AND o.status = 'completed'
+	) st ON TRUE
+`
+
+func scanClient(row scanner) (Client, error) {
+	var c Client
+	var aoID *int64
+	var aoStatus, aoDesc *string
+	var aoWeight, aoPrice *float64
+	var aoDate *time.Time
+	if err := row.Scan(
+		&c.ID, &c.WorkspaceID, &c.Name, &c.Phone, &c.Address, &c.Description, &c.MaxUsername, &c.Tags,
+		&c.CreatedAt, &c.UpdatedAt,
+		&aoID, &aoStatus, &aoDesc, &aoWeight, &aoPrice, &aoDate,
+		&c.OrdersCount, &c.TotalSpent,
+	); err != nil {
+		return c, err
+	}
+	if c.Tags == nil {
+		c.Tags = []string{}
+	}
+	if aoID != nil && aoStatus != nil {
+		c.ActiveOrder = &ActiveOrderBrief{ID: *aoID, Status: *aoStatus, DeliveryDate: aoDate}
+		if aoDesc != nil {
+			c.ActiveOrder.CakeDescription = *aoDesc
+		}
+		if aoWeight != nil {
+			c.ActiveOrder.WeightKg = *aoWeight
+		}
+		if aoPrice != nil {
+			c.ActiveOrder.Price = *aoPrice
 		}
 	}
-	return &c, nil
+	return c, nil
 }
 
-func (s *Store) GetClientByMaxUserID(ctx context.Context, maxUserID int64) (*Client, error) {
-	var id int64
-	err := s.pool.QueryRow(ctx, `SELECT id FROM clients WHERE max_user_id = $1`, maxUserID).Scan(&id)
-	if err != nil {
-		return nil, err
+func (s *Store) ListClients(ctx context.Context, workspaceID int64, search, tag string) ([]Client, error) {
+	query := clientSelect + ` WHERE c.workspace_id = $1`
+	args := []any{workspaceID}
+
+	if q := strings.TrimSpace(search); q != "" {
+		args = append(args, "%"+q+"%")
+		n := len(args)
+		query += fmt.Sprintf(` AND (c.name ILIKE $%[1]d OR c.phone ILIKE $%[1]d OR c.address ILIKE $%[1]d
+			OR c.description ILIKE $%[1]d OR c.max_username ILIKE $%[1]d OR array_to_string(c.tags, ' ') ILIKE $%[1]d)`, n)
 	}
-	return s.GetClient(ctx, id)
-}
-
-func (s *Store) ListClients(ctx context.Context, search, filter string) ([]Client, error) {
-	query := `
-		SELECT c.id, c.max_user_id, c.max_chat_id, c.first_name, c.last_name, c.username, c.avatar_url,
-		       c.custom_name, c.phone, c.address, c.description, c.unread_count, c.last_message_text,
-		       c.last_message_at, c.created_at, c.updated_at,
-		       ao.id, ao.status, ao.cake_description, ao.weight_kg, ao.price, ao.delivery_date
-		FROM clients c
-		LEFT JOIN LATERAL (
-			SELECT id, status, cake_description, weight_kg, price, delivery_date
-			FROM orders o
-			WHERE o.client_id = c.id AND o.status NOT IN ('completed', 'cancelled')
-			ORDER BY o.created_at DESC
-			LIMIT 1
-		) ao ON TRUE
-		WHERE 1=1
-	`
-	var args []any
-	argIdx := 1
-
-	if strings.TrimSpace(search) != "" {
-		query += fmt.Sprintf(` AND (
-			c.first_name ILIKE $%d OR
-			c.last_name ILIKE $%d OR
-			c.custom_name ILIKE $%d OR
-			c.username ILIKE $%d OR
-			c.phone ILIKE $%d OR
-			c.description ILIKE $%d OR
-			c.address ILIKE $%d
-		)`, argIdx, argIdx, argIdx, argIdx, argIdx, argIdx, argIdx)
-		args = append(args, "%"+strings.TrimSpace(search)+"%")
-		argIdx++
+	if t := strings.TrimSpace(tag); t != "" {
+		args = append(args, t)
+		query += fmt.Sprintf(` AND $%d = ANY(c.tags)`, len(args))
 	}
-
-	switch filter {
-	case "unread":
-		query += ` AND c.unread_count > 0`
-	case "active_order":
-		query += ` AND ao.id IS NOT NULL`
-	}
-
-	query += ` ORDER BY c.last_message_at DESC, c.id DESC`
+	query += ` ORDER BY lower(c.name) ASC, c.id ASC`
 
 	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
@@ -341,236 +494,239 @@ func (s *Store) ListClients(ctx context.Context, search, filter string) ([]Clien
 	}
 	defer rows.Close()
 
-	var result []Client
+	list := []Client{}
 	for rows.Next() {
-		var c Client
-		var aoID *int64
-		var aoStatus, aoDesc *string
-		var aoWeight, aoPrice *float64
-		var aoDate *time.Time
-
-		if err := rows.Scan(
-			&c.ID, &c.MaxUserID, &c.MaxChatID, &c.FirstName, &c.LastName, &c.Username, &c.AvatarURL,
-			&c.CustomName, &c.Phone, &c.Address, &c.Description, &c.UnreadCount, &c.LastMessageText,
-			&c.LastMessageAt, &c.CreatedAt, &c.UpdatedAt,
-			&aoID, &aoStatus, &aoDesc, &aoWeight, &aoPrice, &aoDate,
-		); err != nil {
+		c, err := scanClient(rows)
+		if err != nil {
 			return nil, err
 		}
-		if aoID != nil && aoStatus != nil {
-			c.ActiveOrder = &ActiveOrderBrief{
-				ID:              *aoID,
-				Status:          *aoStatus,
-				CakeDescription: derefStr(aoDesc),
-				WeightKg:        derefFloat(aoWeight),
-				Price:           derefFloat(aoPrice),
-				DeliveryDate:    aoDate,
-			}
-		}
-		result = append(result, c)
+		list = append(list, c)
 	}
-	if result == nil {
-		result = []Client{}
-	}
-	return result, nil
+	return list, rows.Err()
 }
 
-func (s *Store) UpdateClientProfile(ctx context.Context, id int64, customName, phone, address, description string) (*Client, error) {
-	_, err := s.pool.Exec(ctx, `
-		UPDATE clients
-		SET custom_name = $2,
-		    phone = $3,
-		    address = $4,
-		    description = $5,
-		    updated_at = NOW()
-		WHERE id = $1
-	`, id, strings.TrimSpace(customName), strings.TrimSpace(phone), strings.TrimSpace(address), strings.TrimSpace(description))
+func (s *Store) GetClient(ctx context.Context, workspaceID, id int64) (*Client, error) {
+	c, err := scanClient(s.pool.QueryRow(ctx, clientSelect+` WHERE c.workspace_id = $1 AND c.id = $2`, workspaceID, id))
 	if err != nil {
 		return nil, err
 	}
-	return s.GetClient(ctx, id)
+	return &c, nil
 }
 
-func (s *Store) UpdateClientPhone(ctx context.Context, id int64, phone string) (*Client, error) {
-	_, err := s.pool.Exec(ctx, `
-		UPDATE clients SET phone = $2, updated_at = NOW() WHERE id = $1
-	`, id, strings.TrimSpace(phone))
+func (s *Store) CreateClient(ctx context.Context, workspaceID int64, c Client) (*Client, error) {
+	if c.Tags == nil {
+		c.Tags = []string{}
+	}
+	var id int64
+	err := s.pool.QueryRow(ctx, `
+		INSERT INTO clients (workspace_id, name, phone, address, description, max_username, tags)
+		VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+		workspaceID, c.Name, c.Phone, c.Address, c.Description, c.MaxUsername, c.Tags).Scan(&id)
 	if err != nil {
 		return nil, err
 	}
-	return s.GetClient(ctx, id)
+	return s.GetClient(ctx, workspaceID, id)
 }
 
-func (s *Store) ResetUnreadCount(ctx context.Context, clientID int64) error {
-	_, err := s.pool.Exec(ctx, `UPDATE clients SET unread_count = 0 WHERE id = $1`, clientID)
-	return err
-}
-
-func (s *Store) CreateMessage(ctx context.Context, clientID int64, maxMID, senderType, text string, attachments []Attachment, incrementUnread bool) (*Message, error) {
-	if attachments == nil {
-		attachments = []Attachment{}
+func (s *Store) UpdateClient(ctx context.Context, workspaceID, id int64, c Client) (*Client, error) {
+	if c.Tags == nil {
+		c.Tags = []string{}
 	}
-	attBytes, err := json.Marshal(attachments)
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE clients SET name = $3, phone = $4, address = $5, description = $6,
+		       max_username = $7, tags = $8, updated_at = NOW()
+		WHERE workspace_id = $1 AND id = $2`,
+		workspaceID, id, c.Name, c.Phone, c.Address, c.Description, c.MaxUsername, c.Tags)
 	if err != nil {
 		return nil, err
 	}
-
-	var m Message
-	var rawAtt []byte
-	err = s.pool.QueryRow(ctx, `
-		INSERT INTO messages (client_id, max_mid, sender_type, text, attachments, created_at)
-		VALUES ($1, $2, $3, $4, $5::jsonb, NOW())
-		RETURNING id, client_id, max_mid, sender_type, text, attachments, created_at
-	`, clientID, maxMID, senderType, text, string(attBytes)).Scan(
-		&m.ID, &m.ClientID, &m.MaxMID, &m.SenderType, &m.Text, &rawAtt, &m.CreatedAt,
-	)
-	if err != nil {
-		return nil, err
+	if tag.RowsAffected() == 0 {
+		return nil, ErrNotFound
 	}
-	_ = json.Unmarshal(rawAtt, &m.Attachments)
-	if m.Attachments == nil {
-		m.Attachments = []Attachment{}
-	}
-
-	preview := strings.TrimSpace(text)
-	if preview == "" && len(attachments) > 0 {
-		preview = "📷 Фотография"
-	}
-	if len([]rune(preview)) > 120 {
-		preview = string([]rune(preview)[:120]) + "…"
-	}
-
-	if incrementUnread {
-		_, _ = s.pool.Exec(ctx, `
-			UPDATE clients
-			SET last_message_text = $2,
-			    last_message_at = $3,
-			    unread_count = unread_count + 1,
-			    updated_at = NOW()
-			WHERE id = $1
-		`, clientID, preview, m.CreatedAt)
-	} else {
-		_, _ = s.pool.Exec(ctx, `
-			UPDATE clients
-			SET last_message_text = $2,
-			    last_message_at = $3,
-			    updated_at = NOW()
-			WHERE id = $1
-		`, clientID, preview, m.CreatedAt)
-	}
-
-	return &m, nil
+	return s.GetClient(ctx, workspaceID, id)
 }
 
-func (s *Store) ListMessages(ctx context.Context, clientID int64, limit int) ([]Message, error) {
-	if limit <= 0 || limit > 500 {
-		limit = 200
+func (s *Store) DeleteClient(ctx context.Context, workspaceID, id int64) error {
+	tag, err := s.pool.Exec(ctx, `DELETE FROM clients WHERE workspace_id = $1 AND id = $2`, workspaceID, id)
+	if err != nil {
+		return err
 	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ---------- Notes ----------
+
+func (s *Store) ListNotes(ctx context.Context, workspaceID, clientID int64) ([]Note, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, client_id, max_mid, sender_type, text, attachments, created_at
-		FROM messages
-		WHERE client_id = $1
-		ORDER BY created_at ASC, id ASC
-		LIMIT $2
-	`, clientID, limit)
+		SELECT id, client_id, author_name, text, created_at
+		FROM client_notes
+		WHERE workspace_id = $1 AND client_id = $2
+		ORDER BY created_at DESC, id DESC`, workspaceID, clientID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-
-	var list []Message
+	list := []Note{}
 	for rows.Next() {
-		var m Message
-		var rawAtt []byte
-		if err := rows.Scan(&m.ID, &m.ClientID, &m.MaxMID, &m.SenderType, &m.Text, &rawAtt, &m.CreatedAt); err != nil {
+		var n Note
+		if err := rows.Scan(&n.ID, &n.ClientID, &n.AuthorName, &n.Text, &n.CreatedAt); err != nil {
 			return nil, err
 		}
-		_ = json.Unmarshal(rawAtt, &m.Attachments)
-		if m.Attachments == nil {
-			m.Attachments = []Attachment{}
-		}
-		list = append(list, m)
+		list = append(list, n)
 	}
-	if list == nil {
-		list = []Message{}
-	}
-	return list, nil
+	return list, rows.Err()
 }
 
-func (s *Store) GetOrderByID(ctx context.Context, orderID int64) (*Order, error) {
+func (s *Store) AddNote(ctx context.Context, workspaceID, clientID, authorID int64, authorName, text string) (*Note, error) {
+	var exists bool
+	if err := s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM clients WHERE id = $1 AND workspace_id = $2)`,
+		clientID, workspaceID).Scan(&exists); err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, ErrNotFound
+	}
+	var n Note
+	err := s.pool.QueryRow(ctx, `
+		INSERT INTO client_notes (client_id, workspace_id, author_id, author_name, text)
+		VALUES ($1, $2, $3, $4, $5)
+		RETURNING id, client_id, author_name, text, created_at`,
+		clientID, workspaceID, authorID, authorName, text).Scan(&n.ID, &n.ClientID, &n.AuthorName, &n.Text, &n.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &n, nil
+}
+
+func (s *Store) DeleteNote(ctx context.Context, workspaceID, noteID int64) error {
+	tag, err := s.pool.Exec(ctx, `DELETE FROM client_notes WHERE workspace_id = $1 AND id = $2`, workspaceID, noteID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ---------- Orders ----------
+
+const orderSelect = `
+	SELECT o.id, o.workspace_id, o.client_id, c.name, o.status, o.cake_description, o.filling, o.decor_inscription,
+	       o.weight_kg, o.price, o.prepayment, o.payment_status, o.delivery_type, o.delivery_address, o.delivery_date,
+	       o.remind_before_min, o.created_at, o.updated_at, o.completed_at
+	FROM orders o
+	JOIN clients c ON c.id = o.client_id
+`
+
+func scanOrder(row scanner) (Order, error) {
 	var o Order
-	err := s.pool.QueryRow(ctx, `
-		SELECT id, client_id, status, cake_description, filling, decor_inscription,
-		       weight_kg, price, prepayment, payment_status, delivery_type,
-		       delivery_address, delivery_date, created_at, updated_at, completed_at
-		FROM orders WHERE id = $1
-	`, orderID).Scan(
-		&o.ID, &o.ClientID, &o.Status, &o.CakeDescription, &o.Filling, &o.DecorInscription,
-		&o.WeightKg, &o.Price, &o.Prepayment, &o.PaymentStatus, &o.DeliveryType,
-		&o.DeliveryAddress, &o.DeliveryDate, &o.CreatedAt, &o.UpdatedAt, &o.CompletedAt,
-	)
-	if err != nil {
-		return nil, err
-	}
-	photos, err := s.listOrderPhotos(ctx, o.ID)
-	if err != nil {
-		return nil, err
-	}
-	o.Photos = photos
-	return &o, nil
+	err := row.Scan(&o.ID, &o.WorkspaceID, &o.ClientID, &o.ClientName, &o.Status, &o.CakeDescription, &o.Filling,
+		&o.DecorInscription, &o.WeightKg, &o.Price, &o.Prepayment, &o.PaymentStatus, &o.DeliveryType,
+		&o.DeliveryAddress, &o.DeliveryDate, &o.RemindBeforeMin, &o.CreatedAt, &o.UpdatedAt, &o.CompletedAt)
+	o.Photos = []OrderPhoto{}
+	return o, err
 }
 
-func (s *Store) GetActiveOrder(ctx context.Context, clientID int64) (*Order, error) {
-	var orderID int64
-	err := s.pool.QueryRow(ctx, `
-		SELECT id FROM orders
-		WHERE client_id = $1 AND status NOT IN ('completed', 'cancelled')
-		ORDER BY created_at DESC, id DESC
-		LIMIT 1
-	`, clientID).Scan(&orderID)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	return s.GetOrderByID(ctx, orderID)
-}
-
-func (s *Store) ListOrderHistory(ctx context.Context, clientID int64) ([]Order, error) {
-	rows, err := s.pool.Query(ctx, `
-		SELECT id, client_id, status, cake_description, filling, decor_inscription,
-		       weight_kg, price, prepayment, payment_status, delivery_type,
-		       delivery_address, delivery_date, created_at, updated_at, completed_at
-		FROM orders
-		WHERE client_id = $1 AND status IN ('completed', 'cancelled')
-		ORDER BY COALESCE(completed_at, updated_at) DESC, id DESC
-	`, clientID)
+func (s *Store) queryOrders(ctx context.Context, where string, args ...any) ([]Order, error) {
+	rows, err := s.pool.Query(ctx, orderSelect+where, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	var orders []Order
+	list := []Order{}
 	for rows.Next() {
-		var o Order
-		if err := rows.Scan(
-			&o.ID, &o.ClientID, &o.Status, &o.CakeDescription, &o.Filling, &o.DecorInscription,
-			&o.WeightKg, &o.Price, &o.Prepayment, &o.PaymentStatus, &o.DeliveryType,
-			&o.DeliveryAddress, &o.DeliveryDate, &o.CreatedAt, &o.UpdatedAt, &o.CompletedAt,
-		); err != nil {
+		o, err := scanOrder(rows)
+		if err != nil {
 			return nil, err
 		}
-		o.Photos, _ = s.listOrderPhotos(ctx, o.ID)
-		orders = append(orders, o)
+		list = append(list, o)
 	}
-	if orders == nil {
-		orders = []Order{}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
-	return orders, nil
+	rows.Close()
+	return list, s.attachPhotos(ctx, list)
 }
 
-func (s *Store) SaveOrder(ctx context.Context, in Order) (*Order, error) {
+func (s *Store) attachPhotos(ctx context.Context, orders []Order) error {
+	if len(orders) == 0 {
+		return nil
+	}
+	ids := make([]int64, 0, len(orders))
+	index := make(map[int64]int, len(orders))
+	for i, o := range orders {
+		ids = append(ids, o.ID)
+		index[o.ID] = i
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, order_id, kind, s3_key, url, caption, created_at
+		FROM order_photos WHERE order_id = ANY($1)
+		ORDER BY created_at ASC, id ASC`, ids)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var p OrderPhoto
+		if err := rows.Scan(&p.ID, &p.OrderID, &p.Kind, &p.S3Key, &p.URL, &p.Caption, &p.CreatedAt); err != nil {
+			return err
+		}
+		if i, ok := index[p.OrderID]; ok {
+			orders[i].Photos = append(orders[i].Photos, p)
+		}
+	}
+	return rows.Err()
+}
+
+func (s *Store) GetOrder(ctx context.Context, workspaceID, orderID int64) (*Order, error) {
+	list, err := s.queryOrders(ctx, ` WHERE o.workspace_id = $1 AND o.id = $2`, workspaceID, orderID)
+	if err != nil {
+		return nil, err
+	}
+	if len(list) == 0 {
+		return nil, ErrNotFound
+	}
+	return &list[0], nil
+}
+
+// GetActiveOrder returns nil, nil when the client has no active order.
+func (s *Store) GetActiveOrder(ctx context.Context, workspaceID, clientID int64) (*Order, error) {
+	list, err := s.queryOrders(ctx, `
+		WHERE o.workspace_id = $1 AND o.client_id = $2 AND o.status NOT IN ('completed', 'cancelled')
+		ORDER BY o.created_at DESC, o.id DESC LIMIT 1`, workspaceID, clientID)
+	if err != nil || len(list) == 0 {
+		return nil, err
+	}
+	return &list[0], nil
+}
+
+func (s *Store) ListOrderHistory(ctx context.Context, workspaceID, clientID int64) ([]Order, error) {
+	return s.queryOrders(ctx, `
+		WHERE o.workspace_id = $1 AND o.client_id = $2 AND o.status IN ('completed', 'cancelled')
+		ORDER BY COALESCE(o.delivery_date, o.completed_at, o.updated_at) DESC, o.id DESC`, workspaceID, clientID)
+}
+
+// ListActiveOrders returns every non-finished order of the workspace, soonest first, undated last.
+func (s *Store) ListActiveOrders(ctx context.Context, workspaceID int64) ([]Order, error) {
+	return s.queryOrders(ctx, `
+		WHERE o.workspace_id = $1 AND o.status NOT IN ('completed', 'cancelled')
+		ORDER BY o.delivery_date ASC NULLS LAST, o.id ASC`, workspaceID)
+}
+
+// ListOrdersBetween returns active orders whose delivery date is within [from, to).
+func (s *Store) ListOrdersBetween(ctx context.Context, workspaceID int64, from, to time.Time) ([]Order, error) {
+	return s.queryOrders(ctx, `
+		WHERE o.workspace_id = $1 AND o.status NOT IN ('completed', 'cancelled')
+		  AND o.delivery_date >= $2 AND o.delivery_date < $3
+		ORDER BY o.delivery_date ASC, o.id ASC`, workspaceID, from, to)
+}
+
+func (s *Store) SaveOrder(ctx context.Context, workspaceID, userID int64, in Order) (*Order, error) {
 	if in.Status == "" {
 		in.Status = "new"
 	}
@@ -581,271 +737,211 @@ func (s *Store) SaveOrder(ctx context.Context, in Order) (*Order, error) {
 		in.DeliveryType = "pickup"
 	}
 
-	var completedAt *time.Time
-	if in.Status == "completed" || in.Status == "cancelled" {
-		now := time.Now()
-		completedAt = &now
-	}
-
 	if in.ID == 0 {
-		var newID int64
+		var exists bool
+		if err := s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM clients WHERE id = $1 AND workspace_id = $2)`,
+			in.ClientID, workspaceID).Scan(&exists); err != nil {
+			return nil, err
+		}
+		if !exists {
+			return nil, ErrNotFound
+		}
+		var id int64
 		err := s.pool.QueryRow(ctx, `
 			INSERT INTO orders (
-				client_id, status, cake_description, filling, decor_inscription,
-				weight_kg, price, prepayment, payment_status, delivery_type,
-				delivery_address, delivery_date, completed_at, created_at, updated_at
-			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NOW(),NOW())
-			RETURNING id
-		`,
-			in.ClientID, in.Status, in.CakeDescription, in.Filling, in.DecorInscription,
-			in.WeightKg, in.Price, in.Prepayment, in.PaymentStatus, in.DeliveryType,
-			in.DeliveryAddress, in.DeliveryDate, completedAt,
-		).Scan(&newID)
+				workspace_id, client_id, status, cake_description, filling, decor_inscription,
+				weight_kg, price, prepayment, payment_status, delivery_type, delivery_address,
+				delivery_date, remind_before_min, created_by, completed_at
+			) VALUES ($1,$2,$3::text,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,
+				CASE WHEN $3::text IN ('completed','cancelled') THEN NOW() ELSE NULL END)
+			RETURNING id`,
+			workspaceID, in.ClientID, in.Status, in.CakeDescription, in.Filling, in.DecorInscription,
+			in.WeightKg, in.Price, in.Prepayment, in.PaymentStatus, in.DeliveryType, in.DeliveryAddress,
+			in.DeliveryDate, in.RemindBeforeMin, userID).Scan(&id)
 		if err != nil {
 			return nil, err
 		}
-		return s.GetOrderByID(ctx, newID)
+		return s.GetOrder(ctx, workspaceID, id)
 	}
 
-	_, err := s.pool.Exec(ctx, `
+	tag, err := s.pool.Exec(ctx, `
 		UPDATE orders SET
-			status = $2,
-			cake_description = $3,
-			filling = $4,
-			decor_inscription = $5,
-			weight_kg = $6,
-			price = $7,
-			prepayment = $8,
-			payment_status = $9,
-			delivery_type = $10,
-			delivery_address = $11,
-			delivery_date = $12,
-			completed_at = COALESCE($13, completed_at),
+			status = $3::text,
+			cake_description = $4,
+			filling = $5,
+			decor_inscription = $6,
+			weight_kg = $7,
+			price = $8,
+			prepayment = $9,
+			payment_status = $10,
+			delivery_type = $11,
+			delivery_address = $12,
+			reminded_at = CASE
+				WHEN delivery_date IS DISTINCT FROM $13::timestamptz OR remind_before_min IS DISTINCT FROM $14::int THEN NULL
+				ELSE reminded_at END,
+			delivery_date = $13::timestamptz,
+			remind_before_min = $14::int,
+			completed_at = CASE WHEN $3::text IN ('completed','cancelled') THEN COALESCE(completed_at, NOW()) ELSE NULL END,
 			updated_at = NOW()
-		WHERE id = $1
-	`,
-		in.ID, in.Status, in.CakeDescription, in.Filling, in.DecorInscription,
-		in.WeightKg, in.Price, in.Prepayment, in.PaymentStatus, in.DeliveryType,
-		in.DeliveryAddress, in.DeliveryDate, completedAt,
-	)
+		WHERE workspace_id = $1 AND id = $2`,
+		workspaceID, in.ID, in.Status, in.CakeDescription, in.Filling, in.DecorInscription,
+		in.WeightKg, in.Price, in.Prepayment, in.PaymentStatus, in.DeliveryType, in.DeliveryAddress,
+		in.DeliveryDate, in.RemindBeforeMin)
 	if err != nil {
 		return nil, err
 	}
-	return s.GetOrderByID(ctx, in.ID)
+	if tag.RowsAffected() == 0 {
+		return nil, ErrNotFound
+	}
+	return s.GetOrder(ctx, workspaceID, in.ID)
 }
 
-func (s *Store) UpdateOrderStatus(ctx context.Context, orderID int64, status string) (*Order, error) {
-	var completedAt *time.Time
-	if status == "completed" || status == "cancelled" {
-		now := time.Now()
-		completedAt = &now
-	}
-	_, err := s.pool.Exec(ctx, `
-		UPDATE orders
-		SET status = $2,
-		    completed_at = CASE WHEN $3::timestamptz IS NOT NULL THEN $3::timestamptz ELSE completed_at END,
-		    updated_at = NOW()
-		WHERE id = $1
-	`, orderID, status, completedAt)
+func (s *Store) UpdateOrderStatus(ctx context.Context, workspaceID, orderID int64, status string) (*Order, error) {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE orders SET
+			status = $3::text,
+			completed_at = CASE WHEN $3::text IN ('completed','cancelled') THEN COALESCE(completed_at, NOW()) ELSE NULL END,
+			updated_at = NOW()
+		WHERE workspace_id = $1 AND id = $2`, workspaceID, orderID, status)
 	if err != nil {
 		return nil, err
 	}
-	return s.GetOrderByID(ctx, orderID)
+	if tag.RowsAffected() == 0 {
+		return nil, ErrNotFound
+	}
+	return s.GetOrder(ctx, workspaceID, orderID)
 }
 
-func (s *Store) AddOrderPhoto(ctx context.Context, orderID int64, kind, s3Key, url, caption string) (*OrderPhoto, error) {
+func (s *Store) DeleteOrder(ctx context.Context, workspaceID, orderID int64) error {
+	tag, err := s.pool.Exec(ctx, `DELETE FROM orders WHERE workspace_id = $1 AND id = $2`, workspaceID, orderID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) AddOrderPhoto(ctx context.Context, workspaceID, orderID int64, kind, s3Key, url, caption string) (*OrderPhoto, error) {
 	if kind != "result" {
 		kind = "reference"
 	}
 	var p OrderPhoto
 	err := s.pool.QueryRow(ctx, `
-		INSERT INTO order_photos (order_id, kind, s3_key, url, caption, created_at)
-		VALUES ($1, $2, $3, $4, $5, NOW())
-		RETURNING id, order_id, kind, s3_key, url, caption, created_at
-	`, orderID, kind, s3Key, url, caption).Scan(
-		&p.ID, &p.OrderID, &p.Kind, &p.S3Key, &p.URL, &p.Caption, &p.CreatedAt,
-	)
+		INSERT INTO order_photos (order_id, kind, s3_key, url, caption)
+		SELECT o.id, $3, $4, $5, $6 FROM orders o WHERE o.id = $2 AND o.workspace_id = $1
+		RETURNING id, order_id, kind, s3_key, url, caption, created_at`,
+		workspaceID, orderID, kind, s3Key, url, caption).Scan(
+		&p.ID, &p.OrderID, &p.Kind, &p.S3Key, &p.URL, &p.Caption, &p.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
 	return &p, nil
 }
 
-func (s *Store) DeleteOrderPhoto(ctx context.Context, photoID int64) error {
-	_, err := s.pool.Exec(ctx, `DELETE FROM order_photos WHERE id = $1`, photoID)
-	return err
+func (s *Store) DeleteOrderPhoto(ctx context.Context, workspaceID, orderID, photoID int64) error {
+	tag, err := s.pool.Exec(ctx, `
+		DELETE FROM order_photos p USING orders o
+		WHERE p.id = $3 AND p.order_id = o.id AND o.id = $2 AND o.workspace_id = $1`,
+		workspaceID, orderID, photoID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
-func (s *Store) listOrderPhotos(ctx context.Context, orderID int64) ([]OrderPhoto, error) {
+// ---------- Reminders ----------
+
+// ClaimDueReminders marks and returns orders whose reminder time has come.
+func (s *Store) ClaimDueReminders(ctx context.Context) ([]ReminderItem, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, order_id, kind, s3_key, url, caption, created_at
-		FROM order_photos
-		WHERE order_id = $1
-		ORDER BY created_at ASC, id ASC
-	`, orderID)
+		WITH due AS (
+			UPDATE orders o SET reminded_at = NOW()
+			WHERE o.reminded_at IS NULL
+			  AND o.remind_before_min > 0
+			  AND o.status NOT IN ('completed', 'cancelled')
+			  AND o.delivery_date IS NOT NULL
+			  AND o.delivery_date - (o.remind_before_min * INTERVAL '1 minute') <= NOW()
+			  AND o.delivery_date > NOW() - INTERVAL '2 hours'
+			RETURNING o.id, o.workspace_id, o.client_id, o.cake_description, o.weight_kg,
+			          o.delivery_date, o.delivery_type, o.delivery_address
+		)
+		SELECT d.id, d.workspace_id, c.name, d.cake_description, d.weight_kg,
+		       d.delivery_date, d.delivery_type, d.delivery_address
+		FROM due d JOIN clients c ON c.id = d.client_id
+		ORDER BY d.delivery_date ASC`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	var list []OrderPhoto
+	var items []ReminderItem
 	for rows.Next() {
-		var p OrderPhoto
-		if err := rows.Scan(&p.ID, &p.OrderID, &p.Kind, &p.S3Key, &p.URL, &p.Caption, &p.CreatedAt); err != nil {
+		var it ReminderItem
+		if err := rows.Scan(&it.OrderID, &it.WorkspaceID, &it.ClientName, &it.CakeDescription,
+			&it.WeightKg, &it.DeliveryDate, &it.DeliveryType, &it.DeliveryAddress); err != nil {
 			return nil, err
 		}
-		list = append(list, p)
+		items = append(items, it)
 	}
-	if list == nil {
-		list = []OrderPhoto{}
-	}
-	return list, nil
+	return items, rows.Err()
 }
 
-func (s *Store) SeedDemoData(ctx context.Context, s3 *storage.S3Storage) error {
-	var count int
-	if err := s.pool.QueryRow(ctx, `SELECT COUNT(*) FROM clients`).Scan(&count); err != nil {
-		return err
-	}
-	if count > 0 {
-		return nil
-	}
+// ---------- Stats ----------
 
-	// Upload sample SVG cake illustrations to S3 so demo orders have real S3 objects
-	berryCakeSVG := []byte(`<svg xmlns="http://www.w3.org/2000/svg" width="600" height="450" viewBox="0 0 600 450">
-		<defs>
-			<linearGradient id="bg1" x1="0" y1="0" x2="1" y2="1">
-				<stop offset="0%" stop-color="#fff0f5"/>
-				<stop offset="100%" stop-color="#ffe4e9"/>
-			</linearGradient>
-		</defs>
-		<rect width="600" height="450" fill="url(#bg1)"/>
-		<ellipse cx="300" cy="360" rx="190" ry="30" fill="#e2c4c8"/>
-		<rect x="150" y="210" width="300" height="140" rx="18" fill="#fffdfc" stroke="#f3c6d3" stroke-width="4"/>
-		<path d="M150 235 Q175 265 200 235 T250 235 T300 235 T350 235 T400 235 T450 235" fill="none" stroke="#e11d48" stroke-width="10" stroke-linecap="round"/>
-		<circle cx="210" cy="198" r="16" fill="#be123c"/>
-		<circle cx="255" cy="195" r="18" fill="#e11d48"/>
-		<circle cx="300" cy="192" r="19" fill="#9f1239"/>
-		<circle cx="345" cy="195" r="18" fill="#e11d48"/>
-		<circle cx="390" cy="198" r="16" fill="#be123c"/>
-		<text x="300" y="305" font-family="sans-serif" font-size="22" font-weight="bold" fill="#881337" text-anchor="middle">Ягодный велюр 2.5 кг</text>
-		<text x="300" y="415" font-family="sans-serif" font-size="16" fill="#9f1239" text-anchor="middle">Фото готового торта (S3 MinIO)</text>
-	</svg>`)
+func (s *Store) Stats(ctx context.Context, workspaceID int64, from, to time.Time) (*Stats, error) {
+	st := &Stats{TopClients: []TopClient{}}
 
-	bentoCakeSVG := []byte(`<svg xmlns="http://www.w3.org/2000/svg" width="600" height="450" viewBox="0 0 600 450">
-		<rect width="600" height="450" fill="#fef9c3"/>
-		<ellipse cx="300" cy="350" rx="170" ry="26" fill="#fde047"/>
-		<rect x="170" y="220" width="260" height="120" rx="24" fill="#ffffff" stroke="#facc15" stroke-width="4"/>
-		<text x="300" y="280" font-family="sans-serif" font-size="24" font-weight="bold" fill="#854d0e" text-anchor="middle">С Днём Рождения! ✨</text>
-		<text x="300" y="312" font-family="sans-serif" font-size="15" fill="#a16207" text-anchor="middle">Бенто Манго-Маракуйя</text>
-		<text x="300" y="410" font-family="sans-serif" font-size="16" fill="#854d0e" text-anchor="middle">Референс клиента (S3 MinIO)</text>
-	</svg>`)
-
-	chocoCakeSVG := []byte(`<svg xmlns="http://www.w3.org/2000/svg" width="600" height="450" viewBox="0 0 600 450">
-		<rect width="600" height="450" fill="#f5f5f4"/>
-		<ellipse cx="300" cy="365" rx="185" ry="28" fill="#d6d3d1"/>
-		<rect x="155" y="185" width="290" height="170" rx="16" fill="#451a03" stroke="#78350f" stroke-width="4"/>
-		<path d="M155 215 Q185 255 210 215 T265 215 T320 215 T375 215 T445 215" fill="none" stroke="#fbbf24" stroke-width="8" stroke-linecap="round"/>
-		<text x="300" y="285" font-family="sans-serif" font-size="22" font-weight="bold" fill="#fef3c7" text-anchor="middle">Три шоколада • Золото</text>
-		<text x="300" y="415" font-family="sans-serif" font-size="16" fill="#57534e" text-anchor="middle">Архив заказов (S3 MinIO)</text>
-	</svg>`)
-
-	berryURL, _ := s3.PutStaticKey(ctx, "demo/berry_velvet_cake.svg", "image/svg+xml", berryCakeSVG)
-	bentoURL, _ := s3.PutStaticKey(ctx, "demo/bento_reference.svg", "image/svg+xml", bentoCakeSVG)
-	chocoURL, _ := s3.PutStaticKey(ctx, "demo/choco_gold_cake.svg", "image/svg+xml", chocoCakeSVG)
-
-	// Client 1: Анна Смирнова
-	c1, err := s.UpsertClientFromBot(ctx, 100001, 200001, "Анна", "Смирнова", "anna_sweet", "")
+	err := s.pool.QueryRow(ctx, `
+		SELECT COUNT(*), COALESCE(SUM(price), 0), COALESCE(SUM(weight_kg), 0)
+		FROM orders
+		WHERE workspace_id = $1 AND status = 'completed'
+		  AND COALESCE(delivery_date, completed_at) >= $2 AND COALESCE(delivery_date, completed_at) < $3`,
+		workspaceID, from, to).Scan(&st.OrdersCompleted, &st.Revenue, &st.WeightKg)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	_, _ = s.UpdateClientProfile(ctx, c1.ID, "Анна Смирнова", "+7 (999) 123-45-67", "г. Москва, ул. Лесная, д. 12, кв. 45", "Постоянная клиентка. Любит нежные ягодные начинки, не слишком сладкий крем. Аллергия на арахис и фундук!")
-
-	// Completed historical order for Анна
-	pastDate := time.Now().AddDate(0, -1, -5)
-	histOrder, err := s.SaveOrder(ctx, Order{
-		ClientID:         c1.ID,
-		Status:           "completed",
-		CakeDescription:  "Двухъярусный торт в розовом велюре со свежей голубикой и малиной",
-		Filling:          "Клубничный пломбир с фисташковым бисквитом",
-		DecorInscription: "С 5-летием, София!",
-		WeightKg:         2.5,
-		Price:            7500,
-		Prepayment:       7500,
-		PaymentStatus:    "paid",
-		DeliveryType:     "delivery",
-		DeliveryAddress:  "г. Москва, ул. Лесная, д. 12, кв. 45",
-		DeliveryDate:     &pastDate,
-	})
-	if err == nil && histOrder != nil {
-		_, _ = s.AddOrderPhoto(ctx, histOrder.ID, "result", "demo/berry_velvet_cake.svg", berryURL, "Готовый торт перед отправкой")
+	if st.OrdersCompleted > 0 {
+		st.AvgCheck = st.Revenue / float64(st.OrdersCompleted)
 	}
 
-	// Active order for Анна
-	upcoming := time.Now().AddDate(0, 0, 3).Truncate(time.Hour)
-	active1, err := s.SaveOrder(ctx, Order{
-		ClientID:         c1.ID,
-		Status:           "in_progress",
-		CakeDescription:  "Праздничный торт с живыми ягодами и акриловым топпером",
-		Filling:          "Манго-маракуйя со сливочным крем-чизом",
-		DecorInscription: "Любимой маме в День Рождения!",
-		WeightKg:         2.0,
-		Price:            6200,
-		Prepayment:       3000,
-		PaymentStatus:    "prepaid",
-		DeliveryType:     "delivery",
-		DeliveryAddress:  "г. Москва, ул. Лесная, д. 12, кв. 45",
-		DeliveryDate:     &upcoming,
-	})
-	if err == nil && active1 != nil {
-		_, _ = s.AddOrderPhoto(ctx, active1.ID, "reference", "demo/bento_reference.svg", bentoURL, "Пожелание по оформлению от Анны")
+	if err := s.pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM clients WHERE workspace_id = $1 AND created_at >= $2 AND created_at < $3`,
+		workspaceID, from, to).Scan(&st.NewClients); err != nil {
+		return nil, err
 	}
 
-	_, _ = s.CreateMessage(ctx, c1.ID, "demo_m1", "client", "Здравствуйте! Хочу заказать торт маме на юбилей к субботе на 2 кг 🎂", nil, false)
-	_, _ = s.CreateMessage(ctx, c1.ID, "demo_m2", "operator", "Здравствуйте, Анна! С радостью сделаем. Начинку Манго-Маракуйя без орехов, как вы любите?", nil, false)
-	_, _ = s.CreateMessage(ctx, c1.ID, "demo_m3", "client", "Да! Вот такой декор нравится, прикрепляю фото-референс:", []Attachment{
-		{Type: "image", S3Key: "demo/bento_reference.svg", URL: bentoURL, Filename: "reference.svg"},
-	}, true)
+	if err := s.pool.QueryRow(ctx, `
+		SELECT COUNT(*),
+		       COALESCE(SUM(GREATEST(price - prepayment, 0)) FILTER (WHERE payment_status <> 'paid'), 0)
+		FROM orders
+		WHERE workspace_id = $1 AND status NOT IN ('completed', 'cancelled')`,
+		workspaceID).Scan(&st.ActiveOrders, &st.Outstanding); err != nil {
+		return nil, err
+	}
 
-	// Client 2: Алексей Воронов
-	c2, err := s.UpsertClientFromBot(ctx, 100002, 200002, "Алексей", "Воронов", "alex_voronov", "")
-	if err == nil && c2 != nil {
-		_, _ = s.UpdateClientProfile(ctx, c2.ID, "Алексей Воронов", "+7 (916) 555-88-99", "Самовывоз из кондитерской", "Предпочитает шоколадные начинки. Заказывает на корпоративы и семейные праздники.")
-		past2 := time.Now().AddDate(0, -2, 0)
-		h2, _ := s.SaveOrder(ctx, Order{
-			ClientID:         c2.ID,
-			Status:           "completed",
-			CakeDescription:  "Шоколадный муссовый торт с золотым кандурином",
-			Filling:          "Три бельгийских шоколада",
-			DecorInscription: "Happy Birthday!",
-			WeightKg:         3.0,
-			Price:            8900,
-			Prepayment:       8900,
-			PaymentStatus:    "paid",
-			DeliveryType:     "pickup",
-			DeliveryAddress:  "Самовывоз",
-			DeliveryDate:     &past2,
-		})
-		if h2 != nil {
-			_, _ = s.AddOrderPhoto(ctx, h2.ID, "result", "demo/choco_gold_cake.svg", chocoURL, "Три шоколада 3 кг")
+	rows, err := s.pool.Query(ctx, `
+		SELECT c.id, c.name, COUNT(*), COALESCE(SUM(o.price), 0)
+		FROM orders o JOIN clients c ON c.id = o.client_id
+		WHERE o.workspace_id = $1 AND o.status = 'completed'
+		  AND COALESCE(o.delivery_date, o.completed_at) >= $2 AND COALESCE(o.delivery_date, o.completed_at) < $3
+		GROUP BY c.id, c.name
+		ORDER BY SUM(o.price) DESC, COUNT(*) DESC
+		LIMIT 5`, workspaceID, from, to)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var t TopClient
+		if err := rows.Scan(&t.ClientID, &t.Name, &t.Orders, &t.Revenue); err != nil {
+			return nil, err
 		}
-		_, _ = s.CreateMessage(ctx, c2.ID, "demo_m4", "client", "Добрый день! Подскажите, можно ли на пятницу сделать торт «Сникерс» на 2.5 кг?", nil, true)
+		st.TopClients = append(st.TopClients, t)
 	}
-
-	return nil
+	return st, rows.Err()
 }
-
-func derefStr(s *string) string {
-	if s == nil {
-		return ""
-	}
-	return *s
-}
-
-func derefFloat(f *float64) float64 {
-	if f == nil {
-		return 0
-	}
-	return *f
-}
-

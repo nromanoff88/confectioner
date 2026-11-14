@@ -4,29 +4,21 @@ import {
   DeliveryType,
   Order,
   ORDER_STATUS_LABELS,
+  OrderInput,
   OrderStatus,
   PAYMENT_STATUS_LABELS,
   PaymentStatus,
+  REMIND_OPTIONS,
 } from '../types';
 
 interface ActiveOrderPanelProps {
   client: Client;
   order: Order | null;
-  onSaveOrder: (payload: {
-    id?: number;
-    status: OrderStatus;
-    cake_description: string;
-    filling: string;
-    decor_inscription: string;
-    weight_kg: number;
-    price: number;
-    prepayment: number;
-    payment_status: PaymentStatus;
-    delivery_type: DeliveryType;
-    delivery_address: string;
-    delivery_date: string;
-  }) => Promise<void>;
+  startCreating: boolean;
+  onCreatingHandled: () => void;
+  onSaveOrder: (payload: OrderInput) => Promise<void>;
   onChangeStatus: (orderId: number, status: OrderStatus) => Promise<void>;
+  onDeleteOrder: (orderId: number) => Promise<void>;
   onUploadPhoto: (orderId: number, kind: 'reference' | 'result', file: File) => Promise<void>;
   onDeletePhoto: (orderId: number, photoId: number) => Promise<void>;
   onPreviewImage: (url: string, caption?: string) => void;
@@ -37,16 +29,19 @@ function toLocalDatetimeInput(iso?: string | null): string {
   const d = new Date(iso);
   if (isNaN(d.getTime())) return '';
   const pad = (n: number) => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(
-    d.getHours()
-  )}:${pad(d.getMinutes())}`;
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(
+    d.getMinutes()
+  )}`;
 }
 
 export const ActiveOrderPanel: React.FC<ActiveOrderPanelProps> = ({
   client,
   order,
+  startCreating,
+  onCreatingHandled,
   onSaveOrder,
   onChangeStatus,
+  onDeleteOrder,
   onUploadPhoto,
   onDeletePhoto,
   onPreviewImage,
@@ -63,12 +58,20 @@ export const ActiveOrderPanel: React.FC<ActiveOrderPanelProps> = ({
   const [deliveryType, setDeliveryType] = useState<DeliveryType>('delivery');
   const [deliveryAddress, setDeliveryAddress] = useState('');
   const [deliveryDate, setDeliveryDate] = useState('');
+  const [remindBefore, setRemindBefore] = useState(120);
   const [saving, setSaving] = useState(false);
-  const [savedToast, setSavedToast] = useState(false);
+  const [toast, setToast] = useState('');
   const [uploadingKind, setUploadingKind] = useState<'reference' | 'result' | null>(null);
 
   const refFileInput = useRef<HTMLInputElement | null>(null);
   const resFileInput = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    if (startCreating && !order) {
+      setIsCreating(true);
+      onCreatingHandled();
+    }
+  }, [startCreating, order, onCreatingHandled]);
 
   useEffect(() => {
     if (order) {
@@ -84,6 +87,7 @@ export const ActiveOrderPanel: React.FC<ActiveOrderPanelProps> = ({
       setDeliveryType(order.delivery_type || 'pickup');
       setDeliveryAddress(order.delivery_address || client.address || '');
       setDeliveryDate(toLocalDatetimeInput(order.delivery_date));
+      setRemindBefore(order.remind_before_min ?? 120);
     } else {
       setStatus('new');
       setCakeDescription('');
@@ -96,6 +100,7 @@ export const ActiveOrderPanel: React.FC<ActiveOrderPanelProps> = ({
       setDeliveryType(client.address ? 'delivery' : 'pickup');
       setDeliveryAddress(client.address || '');
       setDeliveryDate('');
+      setRemindBefore(120);
     }
   }, [order, client.id, client.address]);
 
@@ -103,17 +108,22 @@ export const ActiveOrderPanel: React.FC<ActiveOrderPanelProps> = ({
     return (
       <div className="crm-section-card empty-order-box">
         <div className="empty-order-icon">🎂</div>
-        <h3>Активного заказа пока нет</h3>
+        <h3>Активного заказа нет</h3>
         <p>
-          Создайте новый заказ для клиента, чтобы фиксировать вес, начинку, декор, предоплату и
-          прикреплять фото-референсы и фото готового торта.
+          Запишите заказ клиента: что хочет, вес, начинка, дата, предоплата и фото-референсы. Бот напомнит вам о
+          доставке заранее.
         </p>
         <button className="btn-primary" onClick={() => setIsCreating(true)}>
-          + Создать активный заказ
+          + Новый заказ
         </button>
       </div>
     );
   }
+
+  const flash = (msg: string) => {
+    setToast(msg);
+    setTimeout(() => setToast(''), 2500);
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -132,24 +142,30 @@ export const ActiveOrderPanel: React.FC<ActiveOrderPanelProps> = ({
         delivery_type: deliveryType,
         delivery_address: deliveryAddress,
         delivery_date: deliveryDate ? new Date(deliveryDate).toISOString() : '',
+        remind_before_min: remindBefore,
       });
-      setSavedToast(true);
-      setTimeout(() => setSavedToast(false), 2500);
+      flash('✅ Заказ сохранён!');
+    } catch (err) {
+      flash(err instanceof Error ? `⚠️ ${err.message}` : '⚠️ Ошибка сохранения');
     } finally {
       setSaving(false);
     }
   };
 
-  const handleQuickStatus = async (nextStatus: OrderStatus) => {
-    if (!order) {
-      setStatus(nextStatus);
-      return;
-    }
+  const handleQuickStatus = async (next: OrderStatus) => {
+    if (!order) return;
     setSaving(true);
     try {
-      await onChangeStatus(order.id, nextStatus);
+      await onChangeStatus(order.id, next);
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleDelete = async () => {
+    if (!order) return;
+    if (window.confirm(`Удалить заказ #${order.id} вместе с фотографиями? Это нельзя отменить.`)) {
+      await onDeleteOrder(order.id);
     }
   };
 
@@ -158,6 +174,8 @@ export const ActiveOrderPanel: React.FC<ActiveOrderPanelProps> = ({
     setUploadingKind(kind);
     try {
       await onUploadPhoto(order.id, kind, file);
+    } catch (err) {
+      flash(err instanceof Error ? `⚠️ ${err.message}` : '⚠️ Не удалось загрузить фото');
     } finally {
       setUploadingKind(null);
     }
@@ -179,23 +197,40 @@ export const ActiveOrderPanel: React.FC<ActiveOrderPanelProps> = ({
     'cancelled',
   ];
 
+  const renderPhotos = (photos: typeof refPhotos, alt: string) =>
+    photos.length === 0 ? null : (
+      <div className="photo-grid">
+        {photos.map((p) => (
+          <div key={p.id} className="photo-thumb-card">
+            <img src={p.url} alt={alt} onClick={() => onPreviewImage(p.url, p.caption || alt)} />
+            {order && (
+              <button
+                type="button"
+                className="photo-delete-btn"
+                onClick={() => onDeletePhoto(order.id, p.id)}
+                title="Удалить фото"
+              >
+                ✕
+              </button>
+            )}
+          </div>
+        ))}
+      </div>
+    );
+
   return (
     <div className="crm-section-card active-order-card">
       <div className="section-title-row">
-        <h3>
-          🎂 {order ? `Активный заказ #${order.id}` : 'Новый заказ клиента'}
-        </h3>
+        <h3>🎂 {order ? `Активный заказ #${order.id}` : 'Новый заказ'}</h3>
         {order && (
-          <span className={`status-pill status-${order.status}`}>
-            {ORDER_STATUS_LABELS[order.status]}
-          </span>
+          <span className={`status-pill status-${order.status}`}>{ORDER_STATUS_LABELS[order.status]}</span>
         )}
       </div>
 
       {order && (
         <div className="status-stepper">
           <div className="stepper-hint">
-            🔔 При переключении статуса бот автоматически отправит клиенту уведомление в MAX:
+            Статус заказа. «Выполнен» и «Отменён» переносят заказ в историю клиента и в статистику.
           </div>
           <div className="status-buttons-grid">
             {statusSteps.map((st) => (
@@ -203,9 +238,7 @@ export const ActiveOrderPanel: React.FC<ActiveOrderPanelProps> = ({
                 key={st}
                 type="button"
                 disabled={saving}
-                className={`status-step-btn status-${st} ${
-                  order.status === st ? 'current' : ''
-                }`}
+                className={`status-step-btn status-${st} ${order.status === st ? 'current' : ''}`}
                 onClick={() => handleQuickStatus(st)}
               >
                 {ORDER_STATUS_LABELS[st]}
@@ -222,7 +255,7 @@ export const ActiveOrderPanel: React.FC<ActiveOrderPanelProps> = ({
             <textarea
               rows={2}
               required
-              placeholder="Например: Двухъярусный торт в розовом велюре со свежими ягодами..."
+              placeholder="Например: двухъярусный торт в розовом велюре со свежими ягодами..."
               value={cakeDescription}
               onChange={(e) => setCakeDescription(e.target.value)}
             />
@@ -232,29 +265,28 @@ export const ActiveOrderPanel: React.FC<ActiveOrderPanelProps> = ({
             Начинка / вкус
             <input
               type="text"
-              placeholder="Например: Манго-маракуйя / Фисташка-малина"
+              placeholder="Манго-маракуйя / фисташка-малина"
               value={filling}
               onChange={(e) => setFilling(e.target.value)}
             />
           </label>
 
           <label>
-            Декор и надпись на торте
+            Декор и надпись
             <input
               type="text"
-              placeholder="Например: С Днём Рождения, любимая мама!"
+              placeholder="С Днём Рождения, мама!"
               value={decorInscription}
               onChange={(e) => setDecorInscription(e.target.value)}
             />
           </label>
 
           <label>
-            Вес продукта (кг)
+            Вес (кг)
             <input
               type="number"
               step="0.1"
               min="0"
-              placeholder="2.0"
               value={weightKg}
               onChange={(e) => setWeightKg(e.target.value)}
             />
@@ -262,46 +294,15 @@ export const ActiveOrderPanel: React.FC<ActiveOrderPanelProps> = ({
 
           <label>
             Дата и время готовности / доставки
-            <input
-              type="datetime-local"
-              value={deliveryDate}
-              onChange={(e) => setDeliveryDate(e.target.value)}
-            />
+            <input type="datetime-local" value={deliveryDate} onChange={(e) => setDeliveryDate(e.target.value)} />
           </label>
 
           <label>
-            Стоимость заказа (₽)
-            <input
-              type="number"
-              step="50"
-              min="0"
-              placeholder="6500"
-              value={price}
-              onChange={(e) => setPrice(e.target.value)}
-            />
-          </label>
-
-          <label>
-            Сумма предоплаты (₽)
-            <input
-              type="number"
-              step="50"
-              min="0"
-              placeholder="3000"
-              value={prepayment}
-              onChange={(e) => setPrepayment(e.target.value)}
-            />
-          </label>
-
-          <label>
-            Статус оплаты (К доплате: {remaining} ₽)
-            <select
-              value={paymentStatus}
-              onChange={(e) => setPaymentStatus(e.target.value as PaymentStatus)}
-            >
-              {(Object.keys(PAYMENT_STATUS_LABELS) as PaymentStatus[]).map((k) => (
-                <option key={k} value={k}>
-                  {PAYMENT_STATUS_LABELS[k]}
+            Напомнить мне в боте
+            <select value={remindBefore} onChange={(e) => setRemindBefore(parseInt(e.target.value, 10))}>
+              {REMIND_OPTIONS.map((o) => (
+                <option key={o.value} value={o.value}>
+                  {o.label}
                 </option>
               ))}
             </select>
@@ -309,10 +310,7 @@ export const ActiveOrderPanel: React.FC<ActiveOrderPanelProps> = ({
 
           <label>
             Способ получения
-            <select
-              value={deliveryType}
-              onChange={(e) => setDeliveryType(e.target.value as DeliveryType)}
-            >
+            <select value={deliveryType} onChange={(e) => setDeliveryType(e.target.value as DeliveryType)}>
               <option value="delivery">🚗 Доставка по адресу</option>
               <option value="pickup">🏪 Самовывоз</option>
             </select>
@@ -323,36 +321,65 @@ export const ActiveOrderPanel: React.FC<ActiveOrderPanelProps> = ({
               Адрес доставки заказа
               <input
                 type="text"
-                placeholder="Адрес доставки торта"
                 value={deliveryAddress}
                 onChange={(e) => setDeliveryAddress(e.target.value)}
               />
             </label>
           )}
+
+          <label>
+            Стоимость (₽)
+            <input
+              type="number"
+              step="50"
+              min="0"
+              value={price}
+              onChange={(e) => setPrice(e.target.value)}
+            />
+          </label>
+
+          <label>
+            Предоплата (₽)
+            <input
+              type="number"
+              step="50"
+              min="0"
+              value={prepayment}
+              onChange={(e) => setPrepayment(e.target.value)}
+            />
+          </label>
+
+          <label className="full-width">
+            Статус оплаты (к доплате: {remaining} ₽)
+            <select value={paymentStatus} onChange={(e) => setPaymentStatus(e.target.value as PaymentStatus)}>
+              {(Object.keys(PAYMENT_STATUS_LABELS) as PaymentStatus[]).map((k) => (
+                <option key={k} value={k}>
+                  {PAYMENT_STATUS_LABELS[k]}
+                </option>
+              ))}
+            </select>
+          </label>
         </div>
 
         <div className="form-footer-row">
           {!order && (
-            <button
-              type="button"
-              className="btn-secondary"
-              onClick={() => setIsCreating(false)}
-            >
+            <button type="button" className="btn-secondary" onClick={() => setIsCreating(false)}>
               Отмена
             </button>
           )}
-          {savedToast && <span className="save-toast">✅ Заказ сохранён!</span>}
+          {order && (
+            <button type="button" className="btn-danger-outline" onClick={handleDelete}>
+              🗑 Удалить
+            </button>
+          )}
+          {toast && <span className="save-toast">{toast}</span>}
           <button type="submit" className="btn-primary" disabled={saving}>
-            {saving
-              ? 'Сохранение...'
-              : order
-              ? '💾 Сохранить изменения заказа'
-              : '✨ Создать активный заказ'}
+            {saving ? 'Сохранение...' : order ? '💾 Сохранить заказ' : '✨ Создать заказ'}
           </button>
         </div>
       </form>
 
-      {order && (
+      {order ? (
         <div className="order-photos-section">
           <div className="photo-block">
             <div className="photo-block-header">
@@ -373,34 +400,15 @@ export const ActiveOrderPanel: React.FC<ActiveOrderPanelProps> = ({
                 disabled={uploadingKind === 'reference'}
                 onClick={() => refFileInput.current?.click()}
               >
-                {uploadingKind === 'reference' ? 'Загрузка...' : '+ Загрузить референс'}
+                {uploadingKind === 'reference' ? 'Загрузка...' : '+ Загрузить'}
               </button>
             </div>
             {refPhotos.length === 0 ? (
               <div className="photo-empty-hint">
-                Нет фото-референсов. Загрузите сюда или нажмите «📌 В референс заказа» на любом
-                фото в чате.
+                Сохраните сюда фото-примеры, которые прислал клиент (скриншот из переписки в MAX).
               </div>
             ) : (
-              <div className="photo-grid">
-                {refPhotos.map((p) => (
-                  <div key={p.id} className="photo-thumb-card">
-                    <img
-                      src={p.url}
-                      alt={p.caption || 'Референс'}
-                      onClick={() => onPreviewImage(p.url, p.caption || 'Референс клиента')}
-                    />
-                    <button
-                      type="button"
-                      className="photo-delete-btn"
-                      onClick={() => onDeletePhoto(order.id, p.id)}
-                      title="Удалить фото"
-                    >
-                      ✕
-                    </button>
-                  </div>
-                ))}
-              </div>
+              renderPhotos(refPhotos, 'Референс')
             )}
           </div>
 
@@ -423,39 +431,21 @@ export const ActiveOrderPanel: React.FC<ActiveOrderPanelProps> = ({
                 disabled={uploadingKind === 'result'}
                 onClick={() => resFileInput.current?.click()}
               >
-                {uploadingKind === 'result' ? 'Загрузка...' : '+ Фото готового торта'}
+                {uploadingKind === 'result' ? 'Загрузка...' : '+ Загрузить'}
               </button>
             </div>
             {resPhotos.length === 0 ? (
               <div className="photo-empty-hint">
-                Сфотографируйте готовый торт и загрузите сюда — он сохранится в S3 и останется в
-                истории заказов клиента.
+                Сфотографируйте готовый торт — фото сохранится в истории заказов клиента.
               </div>
             ) : (
-              <div className="photo-grid">
-                {resPhotos.map((p) => (
-                  <div key={p.id} className="photo-thumb-card">
-                    <img
-                      src={p.url}
-                      alt={p.caption || 'Готовый торт'}
-                      onClick={() => onPreviewImage(p.url, p.caption || 'Готовый торт')}
-                    />
-                    <button
-                      type="button"
-                      className="photo-delete-btn"
-                      onClick={() => onDeletePhoto(order.id, p.id)}
-                      title="Удалить фото"
-                    >
-                      ✕
-                    </button>
-                  </div>
-                ))}
-              </div>
+              renderPhotos(resPhotos, 'Готовый торт')
             )}
           </div>
         </div>
+      ) : (
+        <div className="photo-empty-hint">Фотографии можно добавить после создания заказа.</div>
       )}
     </div>
   );
 };
-

@@ -1,76 +1,119 @@
 import React, { useEffect, useState } from 'react';
-import { Client, clientDisplayName } from '../types';
+import { Client, ClientInput, TAG_PRESETS } from '../types';
 
 interface ClientCardProps {
   client: Client;
-  onSaveProfile: (data: {
-    custom_name: string;
-    phone: string;
-    address: string;
-    description: string;
-  }) => Promise<void>;
+  onSave: (data: ClientInput) => Promise<void>;
+  onDelete: () => Promise<void>;
 }
 
-export const ClientCard: React.FC<ClientCardProps> = ({ client, onSaveProfile }) => {
-  const [customName, setCustomName] = useState(client.custom_name || clientDisplayName(client));
-  const [phone, setPhone] = useState(client.phone || '');
-  const [address, setAddress] = useState(client.address || '');
-  const [description, setDescription] = useState(client.description || '');
+function openMaxProfile(username: string) {
+  const url = `https://max.ru/${username}`;
+  if (window.WebApp?.openMaxLink) {
+    window.WebApp.openMaxLink(url);
+  } else {
+    window.open(url, '_blank', 'noopener');
+  }
+}
+
+export const ClientCard: React.FC<ClientCardProps> = ({ client, onSave, onDelete }) => {
+  const [name, setName] = useState(client.name);
+  const [phone, setPhone] = useState(client.phone);
+  const [address, setAddress] = useState(client.address);
+  const [maxUsername, setMaxUsername] = useState(client.max_username);
+  const [description, setDescription] = useState(client.description);
+  const [tags, setTags] = useState<string[]>(client.tags);
+  const [customTag, setCustomTag] = useState('');
   const [saving, setSaving] = useState(false);
-  const [savedToast, setSavedToast] = useState(false);
+  const [toast, setToast] = useState('');
 
   useEffect(() => {
-    setCustomName(client.custom_name || clientDisplayName(client));
-    setPhone(client.phone || '');
-    setAddress(client.address || '');
-    setDescription(client.description || '');
-  }, [client.id, client.custom_name, client.phone, client.address, client.description]);
+    setName(client.name);
+    setPhone(client.phone);
+    setAddress(client.address);
+    setMaxUsername(client.max_username);
+    setDescription(client.description);
+    setTags(client.tags);
+  }, [client]);
+
+  const toggleTag = (t: string) =>
+    setTags((prev) => (prev.includes(t) ? prev.filter((x) => x !== t) : [...prev, t]));
+
+  const addCustomTag = () => {
+    const t = customTag.trim();
+    if (t && !tags.includes(t)) setTags([...tags, t]);
+    setCustomTag('');
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setSaving(true);
     try {
-      await onSaveProfile({
-        custom_name: customName,
+      await onSave({
+        name,
         phone,
         address,
         description,
+        max_username: maxUsername,
+        tags,
       });
-      setSavedToast(true);
-      setTimeout(() => setSavedToast(false), 2500);
+      setToast('✅ Сохранено!');
+    } catch (err) {
+      setToast(err instanceof Error ? `⚠️ ${err.message}` : '⚠️ Ошибка сохранения');
     } finally {
       setSaving(false);
+      setTimeout(() => setToast(''), 2500);
     }
   };
+
+  const handleDelete = async () => {
+    if (
+      window.confirm(
+        `Удалить клиента «${client.name}» вместе со всеми заказами, фото и заметками? Это нельзя отменить.`
+      )
+    ) {
+      await onDelete();
+    }
+  };
+
+  const presetsAndCustom = Array.from(new Set([...TAG_PRESETS, ...tags]));
 
   return (
     <form className="crm-section-card" onSubmit={handleSubmit}>
       <div className="section-title-row">
-        <h3>👤 Атрибуты клиента</h3>
-        <span className="max-id-badge">MAX ID: {client.max_user_id}</span>
+        <h3>👤 Данные клиента</h3>
+        <span className="max-id-badge">
+          Заказов: {client.orders_count} • на сумму {Math.round(client.total_spent).toLocaleString('ru-RU')} ₽
+        </span>
+      </div>
+
+      <div className="quick-actions">
+        {client.phone && (
+          <a className="btn-small-outline" href={`tel:${client.phone.replace(/[^+\d]/g, '')}`}>
+            📞 Позвонить
+          </a>
+        )}
+        {client.max_username && (
+          <button type="button" className="btn-small-outline" onClick={() => openMaxProfile(client.max_username)}>
+            💬 Открыть в MAX
+          </button>
+        )}
       </div>
 
       <div className="form-grid">
         <label>
-          Имя клиента
-          <input
-            type="text"
-            value={customName}
-            onChange={(e) => setCustomName(e.target.value)}
-            placeholder="Имя Фамилия"
-          />
+          Имя клиента *
+          <input type="text" required value={name} onChange={(e) => setName(e.target.value)} />
         </label>
-
         <label>
           Телефон
           <input
-            type="text"
+            type="tel"
             value={phone}
             onChange={(e) => setPhone(e.target.value)}
             placeholder="+7 (999) 000-00-00"
           />
         </label>
-
         <label className="full-width">
           Адрес доставки по умолчанию
           <input
@@ -80,25 +123,68 @@ export const ClientCard: React.FC<ClientCardProps> = ({ client, onSaveProfile })
             placeholder="Город, улица, дом, подъезд, квартира"
           />
         </label>
-
         <label className="full-width">
-          Описание клиента (предпочтения, аллергии, заметки)
+          Ник в MAX (необязательно, для кнопки «Открыть в MAX»)
+          <input
+            type="text"
+            value={maxUsername}
+            onChange={(e) => setMaxUsername(e.target.value)}
+            placeholder="username без @"
+          />
+        </label>
+        <label className="full-width">
+          Описание клиента (предпочтения, аллергии, скидки)
           <textarea
             rows={3}
             value={description}
             onChange={(e) => setDescription(e.target.value)}
-            placeholder="Например: любит ягодные начинки, аллергия на орехи и мёд, постоянная скидка 5%..."
+            placeholder="Например: любит ягодные начинки, аллергия на орехи, скидка 5%..."
           />
         </label>
       </div>
 
+      <div>
+        <div className="field-label">Теги</div>
+        <div className="tag-row">
+          {presetsAndCustom.map((t) => (
+            <button
+              type="button"
+              key={t}
+              className={`tag-chip ${tags.includes(t) ? 'on' : ''}`}
+              onClick={() => toggleTag(t)}
+            >
+              {t}
+            </button>
+          ))}
+        </div>
+        <div className="tag-add-row">
+          <input
+            type="text"
+            placeholder="Свой тег..."
+            value={customTag}
+            onChange={(e) => setCustomTag(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                e.preventDefault();
+                addCustomTag();
+              }
+            }}
+          />
+          <button type="button" className="btn-small-outline" onClick={addCustomTag}>
+            + Добавить
+          </button>
+        </div>
+      </div>
+
       <div className="form-footer-row">
-        {savedToast && <span className="save-toast">✅ Сохранено!</span>}
+        {toast && <span className="save-toast">{toast}</span>}
+        <button type="button" className="btn-danger-outline" onClick={handleDelete}>
+          🗑 Удалить клиента
+        </button>
         <button type="submit" className="btn-primary" disabled={saving}>
-          {saving ? 'Сохранение...' : '💾 Сохранить профиль клиента'}
+          {saving ? 'Сохранение...' : '💾 Сохранить'}
         </button>
       </div>
     </form>
   );
 };
-

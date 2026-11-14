@@ -14,10 +14,12 @@ import (
 	"strings"
 	"time"
 
+	"confectioner-backend/internal/bot"
 	"confectioner-backend/internal/config"
+	"confectioner-backend/internal/db"
 )
 
-type OperatorUser struct {
+type initDataUser struct {
 	ID        int64  `json:"id"`
 	FirstName string `json:"first_name"`
 	LastName  string `json:"last_name"`
@@ -26,7 +28,7 @@ type OperatorUser struct {
 
 // ValidateMaxInitData implements the single-URL-decode HMAC-SHA256 validation
 // for window.WebApp.initData per MAX Bridge security guidelines.
-func ValidateMaxInitData(initData, botToken string, maxAge time.Duration) (*OperatorUser, string, error) {
+func ValidateMaxInitData(initData, botToken string, maxAge time.Duration) (*initDataUser, string, error) {
 	values, err := url.ParseQuery(initData)
 	if err != nil {
 		return nil, "", fmt.Errorf("parse initData: %w", err)
@@ -68,56 +70,67 @@ func ValidateMaxInitData(initData, botToken string, maxAge time.Duration) (*Oper
 		return nil, "", fmt.Errorf("initData HMAC signature mismatch")
 	}
 
-	var user OperatorUser
+	var user initDataUser
 	if rawUser := values.Get("user"); rawUser != "" {
 		_ = json.Unmarshal([]byte(rawUser), &user)
 	}
-	startParam := values.Get("start_param")
-	return &user, startParam, nil
+	return &user, values.Get("start_param"), nil
 }
 
-func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
+type authedHandler func(w http.ResponseWriter, r *http.Request, m *db.Member)
+
+// auth identifies the confectioner from the signed MAX initData and scopes the request
+// to their workspace. Outside DEV_MODE a valid signature is always required.
+func (s *Server) auth(next authedHandler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Allow CORS preflight
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
+		m, status, msg := s.authenticate(r)
+		if m == nil {
+			writeError(w, status, msg)
 			return
 		}
-
-		initData := strings.TrimSpace(r.Header.Get("X-Max-Init-Data"))
-		if initData == "" {
-			initData = strings.TrimSpace(r.URL.Query().Get("init_data"))
-		}
-
-		// When opened in a standard browser (outside MAX WebView), initData is empty.
-		// Allow local/browser access unless strict MAX WebApp auth is enforced.
-		if initData == "" {
-			next(w, r)
-			return
-		}
-
-		if s.cfg.MaxBotToken == "" {
-			next(w, r)
-			return
-		}
-
-		user, _, err := ValidateMaxInitData(initData, s.cfg.MaxBotToken, 24*time.Hour)
-		if err != nil {
-			if s.cfg.DevMode {
-				next(w, r)
-				return
-			}
-			writeError(w, http.StatusUnauthorized, "Неверная подпись MAX initData: "+err.Error())
-			return
-		}
-
-		if user != nil && !s.cfg.IsOperator(user.ID) {
-			writeError(w, http.StatusForbidden, fmt.Sprintf("Доступ запрещён для пользователя ID=%d (добавьте ID в OPERATOR_IDS)", user.ID))
-			return
-		}
-
-		next(w, r)
+		next(w, r, m)
 	}
+}
+
+func (s *Server) authenticate(r *http.Request) (*db.Member, int, string) {
+	initData := strings.TrimSpace(r.Header.Get("X-Max-Init-Data"))
+	if initData == "" {
+		initData = strings.TrimSpace(r.URL.Query().Get("init_data"))
+	}
+
+	var info bot.UserInfo
+	if initData == "" {
+		if !s.cfg.DevMode {
+			return nil, http.StatusUnauthorized, "Откройте админку через бота в MAX"
+		}
+		id := int64(999000001)
+		raw := r.Header.Get("X-Dev-User-Id")
+		if raw == "" {
+			raw = r.URL.Query().Get("dev_user")
+		}
+		if v, err := strconv.ParseInt(raw, 10, 64); err == nil && v > 0 {
+			id = v
+		}
+		info = bot.UserInfo{ID: id, FirstName: "Dev"}
+	} else {
+		if s.cfg.MaxBotToken == "" {
+			return nil, http.StatusServiceUnavailable, "MAX_BOT_TOKEN не настроен"
+		}
+		u, _, err := ValidateMaxInitData(initData, s.cfg.MaxBotToken, 24*time.Hour)
+		if err != nil || u.ID == 0 {
+			return nil, http.StatusUnauthorized, "Неверная подпись MAX initData"
+		}
+		info = bot.UserInfo{ID: u.ID, FirstName: u.FirstName, LastName: u.LastName, Username: u.Username}
+	}
+
+	m, status, err := s.bot.EnsureMember(r.Context(), info, 0, "")
+	if err != nil {
+		return nil, http.StatusInternalServerError, "Ошибка базы данных"
+	}
+	if status == "denied" || m == nil {
+		return nil, http.StatusForbidden, "Доступ закрыт. Попросите владельца кондитерской прислать ссылку-приглашение."
+	}
+	return m, 0, ""
 }
 
 func VerifyWebhookSecret(cfg *config.Config, r *http.Request) bool {
@@ -127,4 +140,3 @@ func VerifyWebhookSecret(cfg *config.Config, r *http.Request) bool {
 	got := r.Header.Get("X-Max-Bot-Api-Secret")
 	return subtle.ConstantTimeCompare([]byte(got), []byte(cfg.MaxWebhookSecret)) == 1
 }
-

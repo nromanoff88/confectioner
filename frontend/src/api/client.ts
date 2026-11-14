@@ -1,4 +1,15 @@
-import { Client, Message, Order, OrderPhoto, OrderStatus } from '../types';
+import {
+  Client,
+  ClientDetails,
+  ClientInput,
+  Note,
+  Order,
+  OrderInput,
+  OrderPhoto,
+  OrderStatus,
+  Stats,
+  TeamInfo,
+} from '../types';
 import { getMaxInitData } from './bridge';
 
 function authHeaders(extra?: Record<string, string>): Record<string, string> {
@@ -7,201 +18,96 @@ function authHeaders(extra?: Record<string, string>): Record<string, string> {
   if (initData) {
     headers['X-Max-Init-Data'] = initData;
   }
+  // Local browser testing with DEV_MODE=true: open the app with ?dev_user=<id>
+  const devUser = new URLSearchParams(window.location.search).get('dev_user');
+  if (devUser) {
+    headers['X-Dev-User-Id'] = devUser;
+  }
   return headers;
 }
 
-async function handleResponse<T>(res: Response): Promise<T> {
+async function request<T>(
+  method: string,
+  path: string,
+  body?: unknown,
+  form?: FormData
+): Promise<T> {
+  const init: RequestInit = { method, headers: authHeaders() };
+  if (form) {
+    init.body = form;
+  } else if (body !== undefined) {
+    init.headers = authHeaders({ 'Content-Type': 'application/json' });
+    init.body = JSON.stringify(body);
+  }
+  const res = await fetch(path, init);
   if (!res.ok) {
-    let errText = `HTTP ${res.status}`;
+    let message = `HTTP ${res.status}`;
     try {
       const data = await res.json();
-      if (data?.error) errText = data.error;
+      if (data?.error) message = data.error;
     } catch {
       // ignore
     }
-    throw new Error(errText);
+    throw new Error(message);
   }
   return res.json() as Promise<T>;
 }
 
 export const api = {
-  async getHealth(): Promise<{
-    status: string;
-    bot_configured: boolean;
-    bot_name: string;
-    dev_mode: boolean;
-  }> {
-    const res = await fetch('/api/health');
-    return handleResponse(res);
-  },
+  getHealth: () =>
+    request<{ status: string; bot_configured: boolean; bot_name: string; dev_mode: boolean }>(
+      'GET',
+      '/api/health'
+    ),
 
-  async listClients(search = '', filter = 'all'): Promise<Client[]> {
+  getMe: () => request<{ workspace_name: string; role: 'owner' | 'member' }>('GET', '/api/me'),
+
+  listClients: (search = '', tag = '') => {
     const q = new URLSearchParams();
     if (search) q.set('search', search);
-    if (filter && filter !== 'all') q.set('filter', filter);
-    const res = await fetch(`/api/clients?${q.toString()}`, {
-      headers: authHeaders(),
-    });
-    return handleResponse(res);
+    if (tag) q.set('tag', tag);
+    return request<Client[]>('GET', `/api/clients?${q.toString()}`);
   },
 
-  async createClient(payload: {
-    custom_name: string;
-    phone: string;
-    address: string;
-    description: string;
-  }): Promise<Client> {
-    const res = await fetch('/api/clients', {
-      method: 'POST',
-      headers: authHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify(payload),
-    });
-    return handleResponse(res);
-  },
+  createClient: (data: ClientInput) => request<Client>('POST', '/api/clients', data),
 
-  async getClientDetails(clientId: number): Promise<{
-    client: Client;
-    active_order: Order | null;
-    history: Order[];
-  }> {
-    const res = await fetch(`/api/clients/${clientId}`, {
-      headers: authHeaders(),
-    });
-    return handleResponse(res);
-  },
+  getClientDetails: (id: number) => request<ClientDetails>('GET', `/api/clients/${id}`),
 
-  async updateClientProfile(
-    clientId: number,
-    payload: {
-      custom_name: string;
-      phone: string;
-      address: string;
-      description: string;
-    }
-  ): Promise<Client> {
-    const res = await fetch(`/api/clients/${clientId}`, {
-      method: 'PUT',
-      headers: authHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify(payload),
-    });
-    return handleResponse(res);
-  },
+  updateClient: (id: number, data: ClientInput) =>
+    request<Client>('PUT', `/api/clients/${id}`, data),
 
-  async listMessages(clientId: number): Promise<Message[]> {
-    const res = await fetch(`/api/clients/${clientId}/messages`, {
-      headers: authHeaders(),
-    });
-    return handleResponse(res);
-  },
+  deleteClient: (id: number) => request<{ deleted: boolean }>('DELETE', `/api/clients/${id}`),
 
-  async sendMessage(clientId: number, text: string, file?: File | null): Promise<Message> {
-    if (file) {
-      const form = new FormData();
-      form.append('text', text);
-      form.append('file', file);
-      const res = await fetch(`/api/clients/${clientId}/messages`, {
-        method: 'POST',
-        headers: authHeaders(),
-        body: form,
-      });
-      return handleResponse(res);
-    }
+  addNote: (clientId: number, text: string) =>
+    request<Note>('POST', `/api/clients/${clientId}/notes`, { text }),
 
-    const res = await fetch(`/api/clients/${clientId}/messages`, {
-      method: 'POST',
-      headers: authHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({ text }),
-    });
-    return handleResponse(res);
-  },
+  deleteNote: (noteId: number) => request<{ deleted: boolean }>('DELETE', `/api/notes/${noteId}`),
 
-  async simulateClientMessage(clientId: number, text: string): Promise<Message> {
-    const res = await fetch(`/api/clients/${clientId}/simulate`, {
-      method: 'POST',
-      headers: authHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({ text }),
-    });
-    return handleResponse(res);
-  },
+  saveOrder: (clientId: number, data: OrderInput) =>
+    request<Order>('POST', `/api/clients/${clientId}/orders`, data),
 
-  async saveOrder(
-    clientId: number,
-    payload: {
-      id?: number;
-      status: OrderStatus;
-      cake_description: string;
-      filling: string;
-      decor_inscription: string;
-      weight_kg: number;
-      price: number;
-      prepayment: number;
-      payment_status: string;
-      delivery_type: string;
-      delivery_address: string;
-      delivery_date: string;
-    }
-  ): Promise<Order> {
-    const res = await fetch(`/api/clients/${clientId}/orders`, {
-      method: 'POST',
-      headers: authHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify(payload),
-    });
-    return handleResponse(res);
-  },
+  updateOrderStatus: (orderId: number, status: OrderStatus) =>
+    request<Order>('POST', `/api/orders/${orderId}/status`, { status }),
 
-  async updateOrderStatus(orderId: number, status: OrderStatus): Promise<Order> {
-    const res = await fetch(`/api/orders/${orderId}/status`, {
-      method: 'POST',
-      headers: authHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({ status }),
-    });
-    return handleResponse(res);
-  },
+  deleteOrder: (orderId: number) =>
+    request<{ deleted: boolean }>('DELETE', `/api/orders/${orderId}`),
 
-  async uploadOrderPhoto(
-    orderId: number,
-    kind: 'reference' | 'result',
-    file: File,
-    caption = ''
-  ): Promise<OrderPhoto> {
+  listActiveOrders: () => request<Order[]>('GET', '/api/orders/active'),
+
+  uploadOrderPhoto: (orderId: number, kind: 'reference' | 'result', file: File) => {
     const form = new FormData();
     form.append('kind', kind);
-    form.append('caption', caption);
     form.append('file', file);
-    const res = await fetch(`/api/orders/${orderId}/photos`, {
-      method: 'POST',
-      headers: authHeaders(),
-      body: form,
-    });
-    return handleResponse(res);
+    return request<OrderPhoto>('POST', `/api/orders/${orderId}/photos`, undefined, form);
   },
 
-  async attachChatPhotoToOrder(
-    orderId: number,
-    kind: 'reference' | 'result',
-    s3Key: string,
-    url: string,
-    caption = ''
-  ): Promise<OrderPhoto> {
-    const res = await fetch(`/api/orders/${orderId}/photos`, {
-      method: 'POST',
-      headers: authHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({
-        kind,
-        s3_key: s3Key,
-        url,
-        caption,
-      }),
-    });
-    return handleResponse(res);
-  },
+  deleteOrderPhoto: (orderId: number, photoId: number) =>
+    request<{ deleted: boolean }>('DELETE', `/api/orders/${orderId}/photos/${photoId}`),
 
-  async deleteOrderPhoto(orderId: number, photoId: number): Promise<void> {
-    const res = await fetch(`/api/orders/${orderId}/photos/${photoId}`, {
-      method: 'DELETE',
-      headers: authHeaders(),
-    });
-    await handleResponse(res);
-  },
+  getStats: (month: string) => request<Stats>('GET', `/api/stats?month=${encodeURIComponent(month)}`),
+
+  getTeam: () => request<TeamInfo>('GET', '/api/team'),
+
+  removeMember: (userId: number) =>
+    request<{ deleted: boolean }>('DELETE', `/api/team/${userId}`),
 };
-

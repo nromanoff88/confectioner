@@ -60,11 +60,13 @@ services:
       MAX_BOT_TOKEN: ${MAX_BOT_TOKEN:-}
       MAX_BOT_NAME: ${MAX_BOT_NAME:-confectioner_bot}
       OPERATOR_IDS: ${OPERATOR_IDS:-}
+      REGISTRATION_OPEN: ${REGISTRATION_OPEN:-true}
+      APP_TIMEZONE: ${APP_TIMEZONE:-Asia/Yekaterinburg}
       MAX_UPDATE_MODE: ${MAX_UPDATE_MODE:-polling}
       MAX_WEBHOOK_URL: ${MAX_WEBHOOK_URL:-}
       MAX_WEBHOOK_SECRET: ${MAX_WEBHOOK_SECRET:-change_me_webhook_secret}
       MAX_ROOT_CA_PATH: ${MAX_ROOT_CA_PATH:-/etc/ssl/certs/russian_trusted_root_ca.pem}
-      DEV_MODE: ${DEV_MODE:-true}
+      DEV_MODE: ${DEV_MODE:-false}
     ports:
       - "${BACKEND_PORT:-8080}:8080"
 

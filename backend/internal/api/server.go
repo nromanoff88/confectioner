@@ -2,7 +2,9 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -18,45 +20,45 @@ import (
 )
 
 type Server struct {
-	cfg        *config.Config
-	store      *db.Store
-	s3         *storage.S3Storage
-	botService *bot.Service
-	hub        *SSEHub
+	cfg   *config.Config
+	store *db.Store
+	s3    *storage.S3Storage
+	bot   *bot.Service
 }
 
-func NewServer(cfg *config.Config, store *db.Store, s3 *storage.S3Storage, botService *bot.Service, hub *SSEHub) *Server {
-	return &Server{
-		cfg:        cfg,
-		store:      store,
-		s3:         s3,
-		botService: botService,
-		hub:        hub,
-	}
+func NewServer(cfg *config.Config, store *db.Store, s3 *storage.S3Storage, botService *bot.Service) *Server {
+	return &Server{cfg: cfg, store: store, s3: s3, bot: botService}
 }
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
-	// Public / system endpoints
+	// Public endpoints
 	mux.HandleFunc("GET /api/health", s.handleHealth)
 	mux.HandleFunc("GET /api/media/", s.handleMedia)
 	mux.HandleFunc("POST /api/webhook/max", s.handleMaxWebhook)
 
-	// Authenticated Mini-App endpoints
-	mux.HandleFunc("GET /api/events", s.authMiddleware(s.handleSSE))
-	mux.HandleFunc("GET /api/clients", s.authMiddleware(s.handleListClients))
-	mux.HandleFunc("POST /api/clients", s.authMiddleware(s.handleCreateClient))
-	mux.HandleFunc("GET /api/clients/{id}", s.authMiddleware(s.handleGetClient))
-	mux.HandleFunc("PUT /api/clients/{id}", s.authMiddleware(s.handleUpdateClient))
-	mux.HandleFunc("GET /api/clients/{id}/messages", s.authMiddleware(s.handleListMessages))
-	mux.HandleFunc("POST /api/clients/{id}/messages", s.authMiddleware(s.handleSendOperatorMessage))
-	mux.HandleFunc("POST /api/clients/{id}/simulate", s.authMiddleware(s.handleSimulateClientMessage))
-	mux.HandleFunc("GET /api/clients/{id}/orders", s.authMiddleware(s.handleGetClientOrders))
-	mux.HandleFunc("POST /api/clients/{id}/orders", s.authMiddleware(s.handleSaveOrder))
-	mux.HandleFunc("POST /api/orders/{orderId}/status", s.authMiddleware(s.handleUpdateOrderStatus))
-	mux.HandleFunc("POST /api/orders/{orderId}/photos", s.authMiddleware(s.handleAddOrderPhoto))
-	mux.HandleFunc("DELETE /api/orders/{orderId}/photos/{photoId}", s.authMiddleware(s.handleDeleteOrderPhoto))
+	// Authenticated endpoints (scoped to the confectioner's workspace)
+	mux.HandleFunc("GET /api/me", s.auth(s.handleMe))
+	mux.HandleFunc("GET /api/team", s.auth(s.handleTeam))
+	mux.HandleFunc("DELETE /api/team/{userId}", s.auth(s.handleRemoveMember))
+
+	mux.HandleFunc("GET /api/clients", s.auth(s.handleListClients))
+	mux.HandleFunc("POST /api/clients", s.auth(s.handleCreateClient))
+	mux.HandleFunc("GET /api/clients/{id}", s.auth(s.handleGetClient))
+	mux.HandleFunc("PUT /api/clients/{id}", s.auth(s.handleUpdateClient))
+	mux.HandleFunc("DELETE /api/clients/{id}", s.auth(s.handleDeleteClient))
+	mux.HandleFunc("POST /api/clients/{id}/notes", s.auth(s.handleAddNote))
+	mux.HandleFunc("DELETE /api/notes/{noteId}", s.auth(s.handleDeleteNote))
+	mux.HandleFunc("POST /api/clients/{id}/orders", s.auth(s.handleSaveOrder))
+
+	mux.HandleFunc("GET /api/orders/active", s.auth(s.handleActiveOrders))
+	mux.HandleFunc("POST /api/orders/{orderId}/status", s.auth(s.handleUpdateOrderStatus))
+	mux.HandleFunc("DELETE /api/orders/{orderId}", s.auth(s.handleDeleteOrder))
+	mux.HandleFunc("POST /api/orders/{orderId}/photos", s.auth(s.handleAddOrderPhoto))
+	mux.HandleFunc("DELETE /api/orders/{orderId}/photos/{photoId}", s.auth(s.handleDeleteOrderPhoto))
+
+	mux.HandleFunc("GET /api/stats", s.auth(s.handleStats))
 
 	return corsMiddleware(mux)
 }
@@ -65,7 +67,7 @@ func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Max-Init-Data")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Max-Init-Data, X-Dev-User-Id")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -74,23 +76,23 @@ func corsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// ---------- Public ----------
+
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":         "ok",
-		"bot_configured": s.botService.Client().IsConfigured(),
-		"bot_name":       s.cfg.MaxBotName,
+		"bot_configured": s.bot.Client().IsConfigured(),
+		"bot_name":       s.bot.BotName(),
 		"dev_mode":       s.cfg.DevMode,
 	})
 }
 
 func (s *Server) handleMedia(w http.ResponseWriter, r *http.Request) {
-	key := strings.TrimPrefix(r.URL.Path, "/api/media/")
-	key = strings.TrimLeft(key, "/")
-	if key == "" {
+	key := strings.TrimLeft(strings.TrimPrefix(r.URL.Path, "/api/media/"), "/")
+	if key == "" || strings.Contains(key, "..") {
 		http.NotFound(w, r)
 		return
 	}
-
 	obj, info, err := s.s3.GetObject(r.Context(), key)
 	if err != nil {
 		http.NotFound(w, r)
@@ -101,6 +103,7 @@ func (s *Server) handleMedia(w http.ResponseWriter, r *http.Request) {
 	if info.ContentType != "" {
 		w.Header().Set("Content-Type", info.ContentType)
 	}
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "public, max-age=86400")
 	_, _ = io.Copy(w, obj)
 }
@@ -120,57 +123,89 @@ func (s *Server) handleMaxWebhook(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid json", http.StatusBadRequest)
 		return
 	}
-	// Fast ack per MAX Webhook best practices
 	w.WriteHeader(http.StatusOK)
-	go func() {
-		ctx := r.Context()
-		s.botService.HandleUpdate(ctx, upd)
-	}()
+	go s.bot.HandleUpdate(context.Background(), upd)
 }
 
-func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+// ---------- Me & team ----------
+
+func (s *Server) handleMe(w http.ResponseWriter, r *http.Request, m *db.Member) {
+	writeJSON(w, http.StatusOK, m)
+}
+
+func (s *Server) handleTeam(w http.ResponseWriter, r *http.Request, m *db.Member) {
+	members, err := s.store.ListMembers(r.Context(), m.WorkspaceID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	resp := map[string]any{
+		"workspace_name": m.WorkspaceName,
+		"is_owner":       m.Role == "owner",
+		"members":        members,
+		"me":             m.MaxUserID,
+	}
+	if m.Role == "owner" {
+		resp["invite_code"] = m.InviteCode
+		resp["invite_link"] = s.bot.InviteLink(m.InviteCode)
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
 
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no")
+func (s *Server) handleRemoveMember(w http.ResponseWriter, r *http.Request, m *db.Member) {
+	if m.Role != "owner" {
+		writeError(w, http.StatusForbidden, "Только владелец может удалять кондитеров")
+		return
+	}
+	userID, err := strconv.ParseInt(r.PathValue("userId"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid user id")
+		return
+	}
+	if err := s.store.RemoveMember(r.Context(), m.WorkspaceID, userID); err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": true})
+}
 
-	ch := s.hub.Subscribe()
-	defer s.hub.Unsubscribe(ch)
+// ---------- Clients ----------
 
-	// Initial ping
-	_, _ = fmt.Fprintf(w, "data: %s\n\n", `{"type":"connected"}`)
-	flusher.Flush()
+type clientRequest struct {
+	Name        string   `json:"name"`
+	Phone       string   `json:"phone"`
+	Address     string   `json:"address"`
+	Description string   `json:"description"`
+	MaxUsername string   `json:"max_username"`
+	Tags        []string `json:"tags"`
+}
 
-	ticker := time.NewTicker(20 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-r.Context().Done():
-			return
-		case msg, ok := <-ch:
-			if !ok {
-				return
-			}
-			_, _ = fmt.Fprintf(w, "data: %s\n\n", string(msg))
-			flusher.Flush()
-		case <-ticker.C:
-			_, _ = fmt.Fprintf(w, ": ping\n\n")
-			flusher.Flush()
+func (req clientRequest) toClient() db.Client {
+	seen := map[string]bool{}
+	tags := []string{}
+	for _, t := range req.Tags {
+		t = strings.TrimSpace(t)
+		if r := []rune(t); len(r) > 30 {
+			t = string(r[:30])
 		}
+		if t == "" || seen[strings.ToLower(t)] || len(tags) >= 10 {
+			continue
+		}
+		seen[strings.ToLower(t)] = true
+		tags = append(tags, t)
+	}
+	return db.Client{
+		Name:        strings.TrimSpace(req.Name),
+		Phone:       strings.TrimSpace(req.Phone),
+		Address:     strings.TrimSpace(req.Address),
+		Description: strings.TrimSpace(req.Description),
+		MaxUsername: strings.TrimPrefix(strings.TrimSpace(req.MaxUsername), "@"),
+		Tags:        tags,
 	}
 }
 
-func (s *Server) handleListClients(w http.ResponseWriter, r *http.Request) {
-	search := r.URL.Query().Get("search")
-	filter := r.URL.Query().Get("filter")
-	clients, err := s.store.ListClients(r.Context(), search, filter)
+func (s *Server) handleListClients(w http.ResponseWriter, r *http.Request, m *db.Member) {
+	clients, err := s.store.ListClients(r.Context(), m.WorkspaceID, r.URL.Query().Get("search"), r.URL.Query().Get("tag"))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -178,237 +213,141 @@ func (s *Server) handleListClients(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, clients)
 }
 
-func (s *Server) handleCreateClient(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		CustomName  string `json:"custom_name"`
-		Phone       string `json:"phone"`
-		Address     string `json:"address"`
-		Description string `json:"description"`
-	}
+func (s *Server) handleCreateClient(w http.ResponseWriter, r *http.Request, m *db.Member) {
+	var req clientRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json")
 		return
 	}
-	if strings.TrimSpace(req.CustomName) == "" {
+	c := req.toClient()
+	if c.Name == "" {
 		writeError(w, http.StatusBadRequest, "Укажите имя клиента")
 		return
 	}
-	fakeMaxID := time.Now().UnixNano() / 1e6
-	c, err := s.store.UpsertClientFromBot(r.Context(), fakeMaxID, fakeMaxID, req.CustomName, "", "", "")
+	created, err := s.store.CreateClient(r.Context(), m.WorkspaceID, c)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	c, err = s.store.UpdateClientProfile(r.Context(), c.ID, req.CustomName, req.Phone, req.Address, req.Description)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	s.hub.Broadcast("client_updated", c)
-	writeJSON(w, http.StatusCreated, c)
+	writeJSON(w, http.StatusCreated, created)
 }
 
-func (s *Server) handleGetClient(w http.ResponseWriter, r *http.Request) {
-	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid client id")
+func (s *Server) handleGetClient(w http.ResponseWriter, r *http.Request, m *db.Member) {
+	id, ok := pathID(w, r, "id")
+	if !ok {
 		return
 	}
-	client, err := s.store.GetClient(r.Context(), id)
+	ctx := r.Context()
+	client, err := s.store.GetClient(ctx, m.WorkspaceID, id)
 	if err != nil {
-		writeError(w, http.StatusNotFound, "client not found")
+		writeStoreError(w, err)
 		return
 	}
-	activeOrder, _ := s.store.GetActiveOrder(r.Context(), id)
-	history, _ := s.store.ListOrderHistory(r.Context(), id)
-
+	active, err := s.store.GetActiveOrder(ctx, m.WorkspaceID, id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	history, err := s.store.ListOrderHistory(ctx, m.WorkspaceID, id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	notes, err := s.store.ListNotes(ctx, m.WorkspaceID, id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"client":       client,
-		"active_order": activeOrder,
+		"active_order": active,
 		"history":      history,
+		"notes":        notes,
 	})
 }
 
-func (s *Server) handleUpdateClient(w http.ResponseWriter, r *http.Request) {
-	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid client id")
+func (s *Server) handleUpdateClient(w http.ResponseWriter, r *http.Request, m *db.Member) {
+	id, ok := pathID(w, r, "id")
+	if !ok {
 		return
 	}
-	var req struct {
-		CustomName  string `json:"custom_name"`
-		Phone       string `json:"phone"`
-		Address     string `json:"address"`
-		Description string `json:"description"`
-	}
+	var req clientRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json")
 		return
 	}
-
-	updated, err := s.store.UpdateClientProfile(r.Context(), id, req.CustomName, req.Phone, req.Address, req.Description)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+	c := req.toClient()
+	if c.Name == "" {
+		writeError(w, http.StatusBadRequest, "Укажите имя клиента")
 		return
 	}
-	s.hub.Broadcast("client_updated", updated)
+	updated, err := s.store.UpdateClient(r.Context(), m.WorkspaceID, id, c)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, updated)
 }
 
-func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
-	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid client id")
+func (s *Server) handleDeleteClient(w http.ResponseWriter, r *http.Request, m *db.Member) {
+	id, ok := pathID(w, r, "id")
+	if !ok {
 		return
 	}
-	_ = s.store.ResetUnreadCount(r.Context(), id)
-	msgs, err := s.store.ListMessages(r.Context(), id, 300)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+	if err := s.store.DeleteClient(r.Context(), m.WorkspaceID, id); err != nil {
+		writeStoreError(w, err)
 		return
 	}
-	if updatedClient, err := s.store.GetClient(r.Context(), id); err == nil {
-		s.hub.Broadcast("client_updated", updatedClient)
-	}
-	writeJSON(w, http.StatusOK, msgs)
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": true})
 }
 
-func (s *Server) handleSendOperatorMessage(w http.ResponseWriter, r *http.Request) {
-	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid client id")
+// ---------- Notes ----------
+
+func (s *Server) handleAddNote(w http.ResponseWriter, r *http.Request, m *db.Member) {
+	id, ok := pathID(w, r, "id")
+	if !ok {
 		return
 	}
-	client, err := s.store.GetClient(r.Context(), id)
-	if err != nil {
-		writeError(w, http.StatusNotFound, "client not found")
-		return
-	}
-
-	var text string
-	var attachments []db.Attachment
-	var rawImgBytes []byte
-	var rawImgName string
-
-	contentType := r.Header.Get("Content-Type")
-	if strings.HasPrefix(contentType, "multipart/form-data") {
-		if err := r.ParseMultipartForm(25 << 20); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid multipart form")
-			return
-		}
-		text = strings.TrimSpace(r.FormValue("text"))
-		file, header, err := r.FormFile("file")
-		if err == nil && file != nil {
-			defer file.Close()
-			data, err := io.ReadAll(io.LimitReader(file, 25<<20))
-			if err != nil {
-				writeError(w, http.StatusBadRequest, "read file error")
-				return
-			}
-			ct := header.Header.Get("Content-Type")
-			if ct == "" {
-				ct = http.DetectContentType(data)
-			}
-			s3Key, mediaURL, err := s.s3.Upload(r.Context(), fmt.Sprintf("chat/client_%d", client.ID), header.Filename, ct, bytes.NewReader(data), int64(len(data)))
-			if err != nil {
-				writeError(w, http.StatusInternalServerError, "S3 upload failed: "+err.Error())
-				return
-			}
-			attachments = append(attachments, db.Attachment{
-				Type:     "image",
-				S3Key:    s3Key,
-				URL:      mediaURL,
-				Filename: header.Filename,
-			})
-			rawImgBytes = data
-			rawImgName = header.Filename
-		}
-	} else {
-		var req struct {
-			Text string `json:"text"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid json")
-			return
-		}
-		text = strings.TrimSpace(req.Text)
-	}
-
-	if text == "" && len(attachments) == 0 {
-		writeError(w, http.StatusBadRequest, "message cannot be empty")
-		return
-	}
-
-	msg, err := s.botService.SendOperatorMessage(r.Context(), client, text, attachments, rawImgBytes, rawImgName)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	writeJSON(w, http.StatusCreated, msg)
-}
-
-func (s *Server) handleSimulateClientMessage(w http.ResponseWriter, r *http.Request) {
-	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid client id")
-		return
-	}
-	client, err := s.store.GetClient(r.Context(), id)
-	if err != nil {
-		writeError(w, http.StatusNotFound, "client not found")
-		return
-	}
-
 	var req struct {
 		Text string `json:"text"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
-	if strings.TrimSpace(req.Text) == "" {
-		req.Text = "Здравствуйте! Подскажите, можно добавить свежую голубику сверху на торт?"
-	}
-
-	msg, err := s.store.CreateMessage(r.Context(), client.ID, fmt.Sprintf("sim_%d", time.Now().UnixNano()), "client", req.Text, nil, true)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.Text) == "" {
+		writeError(w, http.StatusBadRequest, "Введите текст заметки")
 		return
 	}
-	refreshed, _ := s.store.GetClient(r.Context(), client.ID)
-	s.hub.Broadcast("new_message", map[string]any{
-		"client":  refreshed,
-		"message": msg,
-	})
-	writeJSON(w, http.StatusCreated, msg)
+	note, err := s.store.AddNote(r.Context(), m.WorkspaceID, id, m.MaxUserID, m.DisplayName(), strings.TrimSpace(req.Text))
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, note)
 }
 
-func (s *Server) handleGetClientOrders(w http.ResponseWriter, r *http.Request) {
-	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid client id")
+func (s *Server) handleDeleteNote(w http.ResponseWriter, r *http.Request, m *db.Member) {
+	id, ok := pathID(w, r, "noteId")
+	if !ok {
 		return
 	}
-	active, err := s.store.GetActiveOrder(r.Context(), id)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+	if err := s.store.DeleteNote(r.Context(), m.WorkspaceID, id); err != nil {
+		writeStoreError(w, err)
 		return
 	}
-	history, err := s.store.ListOrderHistory(r.Context(), id)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"active_order": active,
-		"history":      history,
-	})
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": true})
 }
 
-func (s *Server) handleSaveOrder(w http.ResponseWriter, r *http.Request) {
-	clientID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid client id")
+// ---------- Orders ----------
+
+var (
+	validStatuses = map[string]bool{"new": true, "awaiting_prepayment": true, "in_progress": true, "ready": true, "completed": true, "cancelled": true}
+	validPayments = map[string]bool{"unpaid": true, "prepaid": true, "paid": true}
+	validDelivery = map[string]bool{"pickup": true, "delivery": true}
+)
+
+func (s *Server) handleSaveOrder(w http.ResponseWriter, r *http.Request, m *db.Member) {
+	clientID, ok := pathID(w, r, "id")
+	if !ok {
 		return
 	}
-
 	var req struct {
 		ID               int64   `json:"id"`
 		Status           string  `json:"status"`
@@ -422,200 +361,211 @@ func (s *Server) handleSaveOrder(w http.ResponseWriter, r *http.Request) {
 		DeliveryType     string  `json:"delivery_type"`
 		DeliveryAddress  string  `json:"delivery_address"`
 		DeliveryDate     string  `json:"delivery_date"`
+		RemindBeforeMin  int     `json:"remind_before_min"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json: "+err.Error())
 		return
 	}
+	if req.Status == "" {
+		req.Status = "new"
+	}
+	if req.PaymentStatus == "" {
+		req.PaymentStatus = "unpaid"
+	}
+	if req.DeliveryType == "" {
+		req.DeliveryType = "pickup"
+	}
+	if !validStatuses[req.Status] || !validPayments[req.PaymentStatus] || !validDelivery[req.DeliveryType] {
+		writeError(w, http.StatusBadRequest, "invalid status, payment_status or delivery_type")
+		return
+	}
+	if req.WeightKg < 0 || req.Price < 0 || req.Prepayment < 0 || req.RemindBeforeMin < 0 {
+		writeError(w, http.StatusBadRequest, "values must not be negative")
+		return
+	}
 
-	var parsedDate *time.Time
-	if strings.TrimSpace(req.DeliveryDate) != "" {
+	var date *time.Time
+	if v := strings.TrimSpace(req.DeliveryDate); v != "" {
 		for _, layout := range []string{time.RFC3339, "2006-01-02T15:04", "2006-01-02"} {
-			if t, err := time.Parse(layout, req.DeliveryDate); err == nil {
-				parsedDate = &t
+			if t, err := time.ParseInLocation(layout, v, s.bot.Loc()); err == nil {
+				date = &t
 				break
 			}
 		}
-	}
-
-	var prevStatus string
-	if req.ID > 0 {
-		if existing, err := s.store.GetOrderByID(r.Context(), req.ID); err == nil && existing != nil {
-			prevStatus = existing.Status
+		if date == nil {
+			writeError(w, http.StatusBadRequest, "invalid delivery_date")
+			return
 		}
 	}
 
-	saved, err := s.store.SaveOrder(r.Context(), db.Order{
+	saved, err := s.store.SaveOrder(r.Context(), m.WorkspaceID, m.MaxUserID, db.Order{
 		ID:               req.ID,
 		ClientID:         clientID,
 		Status:           req.Status,
-		CakeDescription:  req.CakeDescription,
-		Filling:          req.Filling,
-		DecorInscription: req.DecorInscription,
+		CakeDescription:  strings.TrimSpace(req.CakeDescription),
+		Filling:          strings.TrimSpace(req.Filling),
+		DecorInscription: strings.TrimSpace(req.DecorInscription),
 		WeightKg:         req.WeightKg,
 		Price:            req.Price,
 		Prepayment:       req.Prepayment,
 		PaymentStatus:    req.PaymentStatus,
 		DeliveryType:     req.DeliveryType,
-		DeliveryAddress:  req.DeliveryAddress,
-		DeliveryDate:     parsedDate,
+		DeliveryAddress:  strings.TrimSpace(req.DeliveryAddress),
+		DeliveryDate:     date,
+		RemindBeforeMin:  req.RemindBeforeMin,
 	})
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeStoreError(w, err)
 		return
 	}
-
-	client, _ := s.store.GetClient(r.Context(), clientID)
-	s.hub.Broadcast("client_updated", client)
-	s.hub.Broadcast("order_updated", saved)
-
-	if prevStatus != "" && prevStatus != saved.Status && client != nil {
-		go s.botService.NotifyOrderStatusChanged(r.Context(), client, saved)
-	}
-
 	writeJSON(w, http.StatusOK, saved)
 }
 
-func (s *Server) handleUpdateOrderStatus(w http.ResponseWriter, r *http.Request) {
-	orderID, err := strconv.ParseInt(r.PathValue("orderId"), 10, 64)
+func (s *Server) handleActiveOrders(w http.ResponseWriter, r *http.Request, m *db.Member) {
+	orders, err := s.store.ListActiveOrders(r.Context(), m.WorkspaceID)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid order id")
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	writeJSON(w, http.StatusOK, orders)
+}
 
+func (s *Server) handleUpdateOrderStatus(w http.ResponseWriter, r *http.Request, m *db.Member) {
+	orderID, ok := pathID(w, r, "orderId")
+	if !ok {
+		return
+	}
 	var req struct {
 		Status string `json:"status"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Status == "" {
-		writeError(w, http.StatusBadRequest, "status is required")
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || !validStatuses[req.Status] {
+		writeError(w, http.StatusBadRequest, "invalid status")
 		return
 	}
-
-	existing, err := s.store.GetOrderByID(r.Context(), orderID)
-	if err != nil || existing == nil {
-		writeError(w, http.StatusNotFound, "order not found")
-		return
-	}
-
-	updated, err := s.store.UpdateOrderStatus(r.Context(), orderID, req.Status)
+	updated, err := s.store.UpdateOrderStatus(r.Context(), m.WorkspaceID, orderID, req.Status)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeStoreError(w, err)
 		return
 	}
-
-	client, _ := s.store.GetClient(r.Context(), updated.ClientID)
-	s.hub.Broadcast("client_updated", client)
-	s.hub.Broadcast("order_updated", updated)
-
-	if existing.Status != updated.Status && client != nil {
-		s.botService.NotifyOrderStatusChanged(r.Context(), client, updated)
-	}
-
 	writeJSON(w, http.StatusOK, updated)
 }
 
-func (s *Server) handleAddOrderPhoto(w http.ResponseWriter, r *http.Request) {
-	orderID, err := strconv.ParseInt(r.PathValue("orderId"), 10, 64)
+func (s *Server) handleDeleteOrder(w http.ResponseWriter, r *http.Request, m *db.Member) {
+	orderID, ok := pathID(w, r, "orderId")
+	if !ok {
+		return
+	}
+	if err := s.store.DeleteOrder(r.Context(), m.WorkspaceID, orderID); err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": true})
+}
+
+func (s *Server) handleAddOrderPhoto(w http.ResponseWriter, r *http.Request, m *db.Member) {
+	orderID, ok := pathID(w, r, "orderId")
+	if !ok {
+		return
+	}
+	// Make sure the order belongs to this workspace before storing anything.
+	if _, err := s.store.GetOrder(r.Context(), m.WorkspaceID, orderID); err != nil {
+		writeStoreError(w, err)
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, 26<<20)
+	if err := r.ParseMultipartForm(25 << 20); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid multipart form")
+		return
+	}
+	file, header, err := r.FormFile("file")
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid order id")
+		writeError(w, http.StatusBadRequest, "file is required")
 		return
 	}
+	defer file.Close()
 
-	order, err := s.store.GetOrderByID(r.Context(), orderID)
-	if err != nil || order == nil {
-		writeError(w, http.StatusNotFound, "order not found")
-		return
-	}
-
-	contentType := r.Header.Get("Content-Type")
-	if strings.HasPrefix(contentType, "multipart/form-data") {
-		if err := r.ParseMultipartForm(25 << 20); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid multipart form")
-			return
-		}
-		kind := r.FormValue("kind")
-		caption := strings.TrimSpace(r.FormValue("caption"))
-		file, header, err := r.FormFile("file")
-		if err != nil {
-			writeError(w, http.StatusBadRequest, "file is required")
-			return
-		}
-		defer file.Close()
-
-		data, err := io.ReadAll(io.LimitReader(file, 25<<20))
-		if err != nil {
-			writeError(w, http.StatusBadRequest, "failed to read file")
-			return
-		}
-		ct := header.Header.Get("Content-Type")
-		if ct == "" {
-			ct = http.DetectContentType(data)
-		}
-
-		s3Key, mediaURL, err := s.s3.Upload(r.Context(), fmt.Sprintf("orders/order_%d", order.ID), header.Filename, ct, bytes.NewReader(data), int64(len(data)))
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "S3 upload error: "+err.Error())
-			return
-		}
-
-		photo, err := s.store.AddOrderPhoto(r.Context(), order.ID, kind, s3Key, mediaURL, caption)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		refreshedOrder, _ := s.store.GetOrderByID(r.Context(), order.ID)
-		s.hub.Broadcast("order_updated", refreshedOrder)
-		writeJSON(w, http.StatusCreated, photo)
-		return
-	}
-
-	// JSON mode: attach existing photo from chat (by s3_key and url) to the order
-	var req struct {
-		Kind    string `json:"kind"`
-		S3Key   string `json:"s3_key"`
-		URL     string `json:"url"`
-		Caption string `json:"caption"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json")
-		return
-	}
-	if req.URL == "" && req.S3Key != "" {
-		req.URL = s.s3.MediaURL(req.S3Key)
-	}
-	if req.URL == "" {
-		writeError(w, http.StatusBadRequest, "url or s3_key is required")
-		return
-	}
-
-	photo, err := s.store.AddOrderPhoto(r.Context(), order.ID, req.Kind, req.S3Key, req.URL, req.Caption)
+	data, err := io.ReadAll(io.LimitReader(file, 25<<20))
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeError(w, http.StatusBadRequest, "failed to read file")
 		return
 	}
-	refreshedOrder, _ := s.store.GetOrderByID(r.Context(), order.ID)
-	s.hub.Broadcast("order_updated", refreshedOrder)
+	contentType := http.DetectContentType(data)
+	if !strings.HasPrefix(contentType, "image/") {
+		writeError(w, http.StatusBadRequest, "Можно загружать только изображения")
+		return
+	}
+
+	key, url, err := s.s3.Upload(r.Context(), fmt.Sprintf("ws_%d/order_%d", m.WorkspaceID, orderID),
+		header.Filename, contentType, bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "S3 upload error: "+err.Error())
+		return
+	}
+	photo, err := s.store.AddOrderPhoto(r.Context(), m.WorkspaceID, orderID, r.FormValue("kind"), key, url,
+		strings.TrimSpace(r.FormValue("caption")))
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
 	writeJSON(w, http.StatusCreated, photo)
 }
 
-func (s *Server) handleDeleteOrderPhoto(w http.ResponseWriter, r *http.Request) {
-	orderID, err := strconv.ParseInt(r.PathValue("orderId"), 10, 64)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid order id")
+func (s *Server) handleDeleteOrderPhoto(w http.ResponseWriter, r *http.Request, m *db.Member) {
+	orderID, ok := pathID(w, r, "orderId")
+	if !ok {
 		return
 	}
-	photoID, err := strconv.ParseInt(r.PathValue("photoId"), 10, 64)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid photo id")
+	photoID, ok := pathID(w, r, "photoId")
+	if !ok {
 		return
 	}
-	if err := s.store.DeleteOrderPhoto(r.Context(), photoID); err != nil {
+	if err := s.store.DeleteOrderPhoto(r.Context(), m.WorkspaceID, orderID, photoID); err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": true})
+}
+
+// ---------- Stats ----------
+
+func (s *Server) handleStats(w http.ResponseWriter, r *http.Request, m *db.Member) {
+	loc := s.bot.Loc()
+	month := r.URL.Query().Get("month")
+	var from time.Time
+	if t, err := time.ParseInLocation("2006-01", month, loc); err == nil {
+		from = t
+	} else {
+		now := time.Now().In(loc)
+		from = time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, loc)
+	}
+	st, err := s.store.Stats(r.Context(), m.WorkspaceID, from, from.AddDate(0, 1, 0))
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	refreshedOrder, _ := s.store.GetOrderByID(r.Context(), orderID)
-	s.hub.Broadcast("order_updated", refreshedOrder)
-	writeJSON(w, http.StatusOK, map[string]any{"deleted": true})
+	st.Month = from.Format("2006-01")
+	writeJSON(w, http.StatusOK, st)
+}
+
+// ---------- Helpers ----------
+
+func pathID(w http.ResponseWriter, r *http.Request, name string) (int64, bool) {
+	id, err := strconv.ParseInt(r.PathValue(name), 10, 64)
+	if err != nil || id <= 0 {
+		writeError(w, http.StatusBadRequest, "invalid "+name)
+		return 0, false
+	}
+	return id, true
+}
+
+func writeStoreError(w http.ResponseWriter, err error) {
+	if errors.Is(err, db.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "Не найдено")
+		return
+	}
+	writeError(w, http.StatusInternalServerError, err.Error())
 }
 
 func writeJSON(w http.ResponseWriter, status int, data any) {
@@ -629,4 +579,3 @@ func writeJSON(w http.ResponseWriter, status int, data any) {
 func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]string{"error": message})
 }
-
