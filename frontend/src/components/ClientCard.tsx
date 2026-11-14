@@ -181,13 +181,7 @@ export const ClientCard: React.FC<ClientCardProps> = ({
               <button
                 type="button"
                 className="btn-primary"
-                onClick={() => {
-                  if (window.WebApp?.close) {
-                    window.WebApp.close();
-                  } else {
-                    openMaxUrl(botLinkUrl);
-                  }
-                }}
+                onClick={() => openMaxUrl(botLinkUrl)}
               >
                 Перейти в чат с ботом
               </button>
