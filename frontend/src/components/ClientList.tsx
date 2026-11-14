@@ -141,7 +141,14 @@ export const ClientList: React.FC<ClientListProps> = ({
                 </div>
                 <div className="chat-item-body">
                   <div className="chat-item-top">
-                    <span className="chat-name">{display}</span>
+                    <span className="chat-name">
+                      {display}
+                      {(c.max_user_id > 0 || Boolean(c.max_username)) && (
+                        <span className="max-linked-pill" title="Привязан к MAX">
+                          MAX
+                        </span>
+                      )}
+                    </span>
                     {c.orders_count > 0 && <span className="chat-time">🎂 {c.orders_count}</span>}
                   </div>
                   {c.phone && <div className="chat-phone-line">📞 {c.phone}</div>}

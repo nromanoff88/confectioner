@@ -48,6 +48,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/clients/{id}", s.auth(s.handleGetClient))
 	mux.HandleFunc("PUT /api/clients/{id}", s.auth(s.handleUpdateClient))
 	mux.HandleFunc("DELETE /api/clients/{id}", s.auth(s.handleDeleteClient))
+	mux.HandleFunc("POST /api/clients/{id}/request-link", s.auth(s.handleRequestClientMaxLink))
+	mux.HandleFunc("DELETE /api/clients/{id}/link", s.auth(s.handleUnlinkClientMax))
 	mux.HandleFunc("POST /api/clients/{id}/notes", s.auth(s.handleAddNote))
 	mux.HandleFunc("DELETE /api/notes/{noteId}", s.auth(s.handleDeleteNote))
 	mux.HandleFunc("POST /api/clients/{id}/orders", s.auth(s.handleSaveOrder))
@@ -176,6 +178,7 @@ type clientRequest struct {
 	Phone       string   `json:"phone"`
 	Address     string   `json:"address"`
 	Description string   `json:"description"`
+	MaxUserID   int64    `json:"max_user_id"`
 	MaxUsername string   `json:"max_username"`
 	Tags        []string `json:"tags"`
 }
@@ -199,6 +202,7 @@ func (req clientRequest) toClient() db.Client {
 		Phone:       strings.TrimSpace(req.Phone),
 		Address:     strings.TrimSpace(req.Address),
 		Description: strings.TrimSpace(req.Description),
+		MaxUserID:   req.MaxUserID,
 		MaxUsername: strings.TrimPrefix(strings.TrimSpace(req.MaxUsername), "@"),
 		Tags:        tags,
 	}
@@ -282,6 +286,41 @@ func (s *Server) handleUpdateClient(w http.ResponseWriter, r *http.Request, m *d
 		return
 	}
 	updated, err := s.store.UpdateClient(r.Context(), m.WorkspaceID, id, c)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, updated)
+}
+
+func (s *Server) handleRequestClientMaxLink(w http.ResponseWriter, r *http.Request, m *db.Member) {
+	id, ok := pathID(w, r, "id")
+	if !ok {
+		return
+	}
+	ctx := r.Context()
+	client, err := s.store.GetClient(ctx, m.WorkspaceID, id)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	if err := s.store.SetMemberPendingLinkClient(ctx, m.MaxUserID, client.ID); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	s.bot.SendLinkPrompt(ctx, m, client)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"bot_url": "https://max.ru/" + s.bot.BotName(),
+	})
+}
+
+func (s *Server) handleUnlinkClientMax(w http.ResponseWriter, r *http.Request, m *db.Member) {
+	id, ok := pathID(w, r, "id")
+	if !ok {
+		return
+	}
+	updated, err := s.store.UnlinkClientMaxContact(r.Context(), m.WorkspaceID, id)
 	if err != nil {
 		writeStoreError(w, err)
 		return

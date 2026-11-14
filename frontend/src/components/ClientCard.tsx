@@ -5,10 +5,11 @@ interface ClientCardProps {
   client: Client;
   onSave: (data: ClientInput) => Promise<void>;
   onDelete: () => Promise<void>;
+  onRequestMaxLink: () => Promise<string>;
+  onUnlinkMax: () => Promise<void>;
 }
 
-function openMaxProfile(username: string) {
-  const url = `https://max.ru/${username}`;
+function openMaxUrl(url: string) {
   if (window.WebApp?.openMaxLink) {
     window.WebApp.openMaxLink(url);
   } else {
@@ -16,7 +17,21 @@ function openMaxProfile(username: string) {
   }
 }
 
-export const ClientCard: React.FC<ClientCardProps> = ({ client, onSave, onDelete }) => {
+function openClientInMax(client: Client) {
+  if (client.max_username) {
+    openMaxUrl(`https://max.ru/${client.max_username}`);
+  } else if (client.max_user_id > 0) {
+    openMaxUrl(`https://max.ru/u/${client.max_user_id}`);
+  }
+}
+
+export const ClientCard: React.FC<ClientCardProps> = ({
+  client,
+  onSave,
+  onDelete,
+  onRequestMaxLink,
+  onUnlinkMax,
+}) => {
   const [name, setName] = useState(client.name);
   const [phone, setPhone] = useState(client.phone);
   const [address, setAddress] = useState(client.address);
@@ -25,6 +40,8 @@ export const ClientCard: React.FC<ClientCardProps> = ({ client, onSave, onDelete
   const [tags, setTags] = useState<string[]>(client.tags);
   const [customTag, setCustomTag] = useState('');
   const [saving, setSaving] = useState(false);
+  const [linking, setLinking] = useState(false);
+  const [botLinkUrl, setBotLinkUrl] = useState('');
   const [toast, setToast] = useState('');
 
   useEffect(() => {
@@ -34,6 +51,7 @@ export const ClientCard: React.FC<ClientCardProps> = ({ client, onSave, onDelete
     setMaxUsername(client.max_username);
     setDescription(client.description);
     setTags(client.tags);
+    setBotLinkUrl('');
   }, [client]);
 
   const toggleTag = (t: string) =>
@@ -76,6 +94,33 @@ export const ClientCard: React.FC<ClientCardProps> = ({ client, onSave, onDelete
     }
   };
 
+  const handleRequestLink = async () => {
+    setLinking(true);
+    try {
+      const url = await onRequestMaxLink();
+      setBotLinkUrl(url);
+      setToast('📩 Бот ждёт контакт в чате MAX');
+    } catch (err) {
+      setToast(err instanceof Error ? `⚠️ ${err.message}` : '⚠️ Ошибка');
+    } finally {
+      setLinking(false);
+    }
+  };
+
+  const handleUnlink = async () => {
+    if (!window.confirm(`Отвязать контакт MAX от клиента «${client.name}»?`)) return;
+    setLinking(true);
+    try {
+      await onUnlinkMax();
+      setToast('Контакт MAX отвязан');
+    } catch (err) {
+      setToast(err instanceof Error ? `⚠️ ${err.message}` : '⚠️ Ошибка');
+    } finally {
+      setLinking(false);
+    }
+  };
+
+  const isMaxLinked = client.max_user_id > 0 || Boolean(client.max_username);
   const presetsAndCustom = Array.from(new Set([...TAG_PRESETS, ...tags]));
 
   return (
@@ -93,12 +138,63 @@ export const ClientCard: React.FC<ClientCardProps> = ({ client, onSave, onDelete
             📞 Позвонить
           </a>
         )}
-        {client.max_username && (
-          <button type="button" className="btn-small-outline" onClick={() => openMaxProfile(client.max_username)}>
+        {isMaxLinked && (
+          <button type="button" className="btn-small-outline" onClick={() => openClientInMax(client)}>
             💬 Открыть в MAX
           </button>
         )}
+        <button
+          type="button"
+          className="btn-small-outline"
+          disabled={linking}
+          onClick={handleRequestLink}
+        >
+          🔗 {isMaxLinked ? 'Перепривязать контакт через бота' : 'Привязать контакт MAX через бота'}
+        </button>
+        {isMaxLinked && (
+          <button type="button" className="btn-small-outline" disabled={linking} onClick={handleUnlink}>
+            ✕ Отвязать MAX
+          </button>
+        )}
       </div>
+
+      {isMaxLinked && (
+        <div className="max-link-banner linked">
+          <span>
+            ✅ <strong>Привязан к MAX:</strong>{' '}
+            {client.max_username ? `@${client.max_username}` : ''}
+            {client.max_username && client.max_user_id > 0 ? ' • ' : ''}
+            {client.max_user_id > 0 ? `ID ${client.max_user_id}` : ''}
+          </span>
+        </div>
+      )}
+
+      {botLinkUrl && (
+        <div className="max-link-banner pending">
+          <div>
+            <strong>📩 Бот ожидает контакт для «{client.name}»</strong>
+            <p style={{ margin: '4px 0 8px', fontSize: 13 }}>
+              Перейдите в чат с ботом и отправьте <strong>Контакт</strong> (скрепка → Контакт) или{' '}
+              <strong>перешлите любое сообщение</strong> от этого клиента.
+            </p>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+              <button
+                type="button"
+                className="btn-primary"
+                onClick={() => {
+                  if (window.WebApp?.close) {
+                    window.WebApp.close();
+                  } else {
+                    openMaxUrl(botLinkUrl);
+                  }
+                }}
+              >
+                Перейти в чат с ботом
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className="form-grid">
         <label>

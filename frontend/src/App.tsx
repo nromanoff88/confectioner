@@ -188,6 +188,20 @@ export const App: React.FC = () => {
     showToast('Клиент удалён');
   };
 
+  const handleRequestMaxLink = async (): Promise<string> => {
+    if (!selectedId) return '';
+    const res = await api.requestClientMaxLink(selectedId);
+    triggerHapticSuccess();
+    return res.bot_url;
+  };
+
+  const handleUnlinkMax = async () => {
+    if (!selectedId) return;
+    await api.unlinkClientMax(selectedId);
+    await refresh();
+    showToast('Привязка MAX снята');
+  };
+
   const handleAddNote = async (text: string) => {
     if (!selectedId) return;
     await api.addNote(selectedId, text);
@@ -377,7 +391,13 @@ export const App: React.FC = () => {
                       />
                     )}
                     {detailTab === 'profile' && (
-                      <ClientCard client={selected} onSave={handleSaveClient} onDelete={handleDeleteClient} />
+                      <ClientCard
+                        client={selected}
+                        onSave={handleSaveClient}
+                        onDelete={handleDeleteClient}
+                        onRequestMaxLink={handleRequestMaxLink}
+                        onUnlinkMax={handleUnlinkMax}
+                      />
                     )}
                     {detailTab === 'notes' && (
                       <NotesPanel notes={details.notes} onAdd={handleAddNote} onDelete={handleDeleteNote} />

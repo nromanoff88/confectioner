@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 	"time"
 
@@ -206,7 +207,168 @@ func (s *Service) handleMessage(ctx context.Context, upd RawUpdate) {
 		s.handleStart(ctx, u, chatID, "join_"+code)
 		return
 	}
+
+	if sc := extractSharedContact(msg); sc != nil {
+		m, status, err := s.EnsureMember(ctx, u, chatID, "")
+		if err != nil {
+			log.Printf("[MAX Bot] EnsureMember error: %v", err)
+			return
+		}
+		if status == "denied" || m == nil {
+			s.sendText(ctx, chatID, u.ID, "🔒 Этот бот — закрытая система учёта для кондитеров.")
+			return
+		}
+		s.handleSharedContact(ctx, m, sc)
+		return
+	}
+
 	s.handleStart(ctx, u, chatID, "")
+}
+
+type SharedContact struct {
+	MaxUserID int64
+	Name      string
+	Username  string
+	Phone     string
+}
+
+func extractSharedContact(msg *RawMessage) *SharedContact {
+	if msg == nil {
+		return nil
+	}
+	allAtts := append([]RawAttachment{}, msg.Body.Attachments...)
+	if msg.Link != nil {
+		allAtts = append(allAtts, msg.Link.Message.Attachments...)
+	}
+	for _, att := range allAtts {
+		if strings.ToLower(att.Type) != "contact" {
+			continue
+		}
+		sc := &SharedContact{
+			Phone: ExtractPhoneFromVCF(att.Payload.VCFInfo),
+			Name:  ExtractNameFromVCF(att.Payload.VCFInfo),
+		}
+		if att.Payload.MaxInfo != nil {
+			u := userFromRaw(att.Payload.MaxInfo)
+			sc.MaxUserID = u.ID
+			sc.Username = strings.TrimPrefix(strings.TrimSpace(u.Username), "@")
+			if sc.Name == "" {
+				sc.Name = strings.TrimSpace(u.FirstName + " " + u.LastName)
+			}
+		}
+		if sc.MaxUserID > 0 || sc.Phone != "" || sc.Username != "" || sc.Name != "" {
+			return sc
+		}
+	}
+
+	// Also support forwarded messages from a client (msg.Link with sender).
+	if msg.Link != nil && msg.Link.Sender != nil {
+		u := userFromRaw(msg.Link.Sender)
+		name := strings.TrimSpace(u.FirstName + " " + u.LastName)
+		if u.ID > 0 || u.Username != "" || name != "" {
+			return &SharedContact{
+				MaxUserID: u.ID,
+				Name:      name,
+				Username:  strings.TrimPrefix(strings.TrimSpace(u.Username), "@"),
+			}
+		}
+	}
+	return nil
+}
+
+func formatClientContactDetails(c *db.Client) string {
+	var lines []string
+	if c.Phone != "" {
+		lines = append(lines, fmt.Sprintf("📞 Телефон: `%s`", clean(c.Phone)))
+	}
+	if c.MaxUsername != "" {
+		lines = append(lines, fmt.Sprintf("💬 MAX: @%s", clean(c.MaxUsername)))
+	}
+	if c.MaxUserID > 0 {
+		lines = append(lines, fmt.Sprintf("🆔 MAX ID: `%d`", c.MaxUserID))
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	return "\n" + strings.Join(lines, "\n")
+}
+
+func (s *Service) handleSharedContact(ctx context.Context, m *db.Member, sc *SharedContact) {
+	// 1. If the confectioner requested linking to a specific client card from the admin panel:
+	if m.PendingLinkClientID > 0 {
+		targetID := m.PendingLinkClientID
+		_ = s.store.SetMemberPendingLinkClient(ctx, m.MaxUserID, 0)
+		linked, err := s.store.LinkClientMaxContact(ctx, m.WorkspaceID, targetID, sc.MaxUserID, sc.Username, sc.Phone, sc.Name)
+		if err == nil && linked != nil {
+			text := fmt.Sprintf("✅ **Контакт MAX привязан к клиенту «%s»!**%s",
+				clean(linked.Name), formatClientContactDetails(linked))
+			s.sendToMember(ctx, m, text, [][]ButtonReq{
+				{{Type: "link", Text: "👤 Открыть карточку клиента", URL: s.AppLink(fmt.Sprintf("client_%d", linked.ID))}},
+				{{Type: "callback", Text: "⬅️ В меню", Payload: "menu"}},
+			})
+			return
+		}
+	}
+
+	// 2. Check if a client with this MAX ID, @username, or phone already exists in the workspace:
+	existing, err := s.store.FindClientByMaxOrPhone(ctx, m.WorkspaceID, sc.MaxUserID, sc.Username, sc.Phone)
+	if err != nil {
+		log.Printf("[MAX Bot] FindClientByMaxOrPhone error: %v", err)
+	}
+	if existing != nil {
+		updated, err := s.store.LinkClientMaxContact(ctx, m.WorkspaceID, existing.ID, sc.MaxUserID, sc.Username, sc.Phone, sc.Name)
+		if err != nil || updated == nil {
+			updated = existing
+		}
+		text := fmt.Sprintf("🔗 **Клиент «%s» найден в базе, привязка к MAX обновлена!**%s",
+			clean(updated.Name), formatClientContactDetails(updated))
+		s.sendToMember(ctx, m, text, [][]ButtonReq{
+			{{Type: "link", Text: "👤 Открыть карточку в админке", URL: s.AppLink(fmt.Sprintf("client_%d", updated.ID))}},
+			{{Type: "callback", Text: "⬅️ В меню", Payload: "menu"}},
+		})
+		return
+	}
+
+	// 3. Otherwise create a new client linked to this MAX contact:
+	name := strings.TrimSpace(sc.Name)
+	if name == "" && sc.Username != "" {
+		name = "@" + sc.Username
+	}
+	if name == "" && sc.Phone != "" {
+		name = sc.Phone
+	}
+	if name == "" {
+		name = fmt.Sprintf("Клиент MAX #%d", sc.MaxUserID)
+	}
+
+	created, err := s.store.CreateClient(ctx, m.WorkspaceID, db.Client{
+		Name:        name,
+		Phone:       sc.Phone,
+		MaxUserID:   sc.MaxUserID,
+		MaxUsername: sc.Username,
+		Tags:        []string{},
+	})
+	if err != nil {
+		log.Printf("[MAX Bot] CreateClient from contact error: %v", err)
+		s.sendToMember(ctx, m, "⚠️ Не удалось сохранить контакт клиента.", nil)
+		return
+	}
+
+	text := fmt.Sprintf("➕ **Клиент «%s» добавлен и привязан к контакту MAX!**%s\n\nЕсли этот клиент уже был записан у вас под другим именем, нажмите «Привязать к существующему» ниже:",
+		clean(created.Name), formatClientContactDetails(created))
+	s.sendToMember(ctx, m, text, [][]ButtonReq{
+		{{Type: "link", Text: "👤 Открыть карточку в админке", URL: s.AppLink(fmt.Sprintf("client_%d", created.ID))}},
+		{{Type: "callback", Text: "🔗 Привязать к существующему клиенту", Payload: fmt.Sprintf("pick_merge_%d", created.ID)}},
+		{{Type: "callback", Text: "⬅️ В меню", Payload: "menu"}},
+	})
+}
+
+func (s *Service) SendLinkPrompt(ctx context.Context, m *db.Member, c *db.Client) {
+	text := fmt.Sprintf("🔗 **Привязка контакта MAX к клиенту «%s»**\n\nОтправьте в этот чат **Контакт** (скрепка → Контакт) или **перешлите любое сообщение** от этого клиента.\n\nСледующий присланный контакт будет автоматически привязан к карточке «%s».",
+		clean(c.Name), clean(c.Name))
+	s.sendToMember(ctx, m, text, [][]ButtonReq{
+		{{Type: "callback", Text: "✖️ Отменить привязку", Payload: "cancel_link"}},
+	})
 }
 
 // handleStart registers/looks up the confectioner and shows the menu.
@@ -269,18 +431,83 @@ func (s *Service) handleCallback(ctx context.Context, upd RawUpdate) {
 	}
 	_ = s.client.AnswerCallback(ctx, chatID, cb.CallbackID, "")
 
-	switch cb.Payload {
-	case "menu":
+	switch {
+	case cb.Payload == "menu":
 		s.sendMenu(ctx, m, "")
-	case "today":
+	case cb.Payload == "today":
 		s.sendDayOrders(ctx, m, 0)
-	case "tomorrow":
+	case cb.Payload == "tomorrow":
 		s.sendDayOrders(ctx, m, 1)
-	case "stats":
+	case cb.Payload == "stats":
 		s.sendStats(ctx, m)
-	case "invite":
+	case cb.Payload == "invite":
 		s.sendInvite(ctx, m)
+	case cb.Payload == "cancel_link":
+		_ = s.store.SetMemberPendingLinkClient(ctx, m.MaxUserID, 0)
+		s.sendMenu(ctx, m, "✖️ Привязка контакта отменена.\n\n")
+	case strings.HasPrefix(cb.Payload, "pick_merge_"):
+		srcID, err := strconv.ParseInt(strings.TrimPrefix(cb.Payload, "pick_merge_"), 10, 64)
+		if err == nil && srcID > 0 {
+			s.sendMergePicker(ctx, m, srcID)
+		}
+	case strings.HasPrefix(cb.Payload, "merge_"):
+		parts := strings.Split(strings.TrimPrefix(cb.Payload, "merge_"), "_")
+		if len(parts) == 2 {
+			srcID, err1 := strconv.ParseInt(parts[0], 10, 64)
+			dstID, err2 := strconv.ParseInt(parts[1], 10, 64)
+			if err1 == nil && err2 == nil && srcID > 0 && dstID > 0 {
+				merged, err := s.store.MergeClientContactInto(ctx, m.WorkspaceID, srcID, dstID)
+				if err != nil {
+					s.sendToMember(ctx, m, "⚠️ Не удалось объединить карточки клиента.", [][]ButtonReq{{{Type: "callback", Text: "⬅️ В меню", Payload: "menu"}}})
+					return
+				}
+				text := fmt.Sprintf("✅ **Контакт MAX привязан к клиенту «%s»!**%s",
+					clean(merged.Name), formatClientContactDetails(merged))
+				s.sendToMember(ctx, m, text, [][]ButtonReq{
+					{{Type: "link", Text: "👤 Открыть карточку в админке", URL: s.AppLink(fmt.Sprintf("client_%d", merged.ID))}},
+					{{Type: "callback", Text: "⬅️ В меню", Payload: "menu"}},
+				})
+			}
+		}
 	}
+}
+
+func (s *Service) sendMergePicker(ctx context.Context, m *db.Member, sourceClientID int64) {
+	clients, err := s.store.ListClients(ctx, m.WorkspaceID, "", "")
+	if err != nil {
+		s.sendToMember(ctx, m, "⚠️ Ошибка загрузки списка клиентов.", nil)
+		return
+	}
+	var rows [][]ButtonReq
+	for _, c := range clients {
+		if c.ID == sourceClientID {
+			continue
+		}
+		label := c.Name
+		if c.Phone != "" {
+			label += " (" + c.Phone + ")"
+		}
+		if r := []rune(label); len(r) > 45 {
+			label = string(r[:45]) + "…"
+		}
+		rows = append(rows, []ButtonReq{{
+			Type:    "callback",
+			Text:    "👤 " + label,
+			Payload: fmt.Sprintf("merge_%d_%d", sourceClientID, c.ID),
+		}})
+		if len(rows) >= 10 {
+			break
+		}
+	}
+	if len(rows) == 0 {
+		s.sendToMember(ctx, m, "ℹ️ В вашей базе пока нет других клиентов для объединения.", [][]ButtonReq{
+			{{Type: "link", Text: "👤 Открыть карточку", URL: s.AppLink(fmt.Sprintf("client_%d", sourceClientID))}},
+			{{Type: "callback", Text: "⬅️ В меню", Payload: "menu"}},
+		})
+		return
+	}
+	rows = append(rows, []ButtonReq{{Type: "callback", Text: "⬅️ Оставить как нового клиента", Payload: "menu"}})
+	s.sendToMember(ctx, m, "🔗 **Выберите существующего клиента**, к которому нужно привязать этот контакт MAX:", rows)
 }
 
 // ---------- Messages ----------
@@ -336,7 +563,7 @@ func (s *Service) sendMenu(ctx context.Context, m *db.Member, prefix string) {
 	}
 	todayN, tomorrowN := counts[0], counts[1]
 
-	text := fmt.Sprintf("%s🎂 **%s**\nСегодня заказов: **%d**, завтра: **%d**.\n\nВыберите действие:",
+	text := fmt.Sprintf("%s🎂 **%s**\nСегодня заказов: **%d**, завтра: **%d**.\n\n💡 _Отправьте сюда Контакт или перешлите сообщение от клиента, чтобы добавить его или привязать к MAX._\n\nВыберите действие:",
 		prefix, clean(m.WorkspaceName), todayN, tomorrowN)
 	s.sendToMember(ctx, m, text, s.menuButtons(m))
 }

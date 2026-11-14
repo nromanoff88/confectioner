@@ -26,16 +26,17 @@ type scanner interface {
 // ---------- Types ----------
 
 type Member struct {
-	MaxUserID     int64     `json:"max_user_id"`
-	WorkspaceID   int64     `json:"workspace_id"`
-	WorkspaceName string    `json:"workspace_name"`
-	InviteCode    string    `json:"-"`
-	ChatID        int64     `json:"-"`
-	FirstName     string    `json:"first_name"`
-	LastName      string    `json:"last_name"`
-	Username      string    `json:"username"`
-	Role          string    `json:"role"` // "owner" | "member"
-	CreatedAt     time.Time `json:"created_at"`
+	MaxUserID           int64     `json:"max_user_id"`
+	WorkspaceID         int64     `json:"workspace_id"`
+	WorkspaceName       string    `json:"workspace_name"`
+	InviteCode          string    `json:"-"`
+	ChatID              int64     `json:"-"`
+	FirstName           string    `json:"first_name"`
+	LastName            string    `json:"last_name"`
+	Username            string    `json:"username"`
+	Role                string    `json:"role"` // "owner" | "member"
+	PendingLinkClientID int64     `json:"pending_link_client_id,omitempty"`
+	CreatedAt           time.Time `json:"created_at"`
 }
 
 func (m Member) DisplayName() string {
@@ -65,6 +66,7 @@ type Client struct {
 	Phone       string            `json:"phone"`
 	Address     string            `json:"address"`
 	Description string            `json:"description"`
+	MaxUserID   int64             `json:"max_user_id"`
 	MaxUsername string            `json:"max_username"`
 	Tags        []string          `json:"tags"`
 	CreatedAt   time.Time         `json:"created_at"`
@@ -204,9 +206,11 @@ CREATE TABLE IF NOT EXISTS members (
 	last_name TEXT NOT NULL DEFAULT '',
 	username TEXT NOT NULL DEFAULT '',
 	role TEXT NOT NULL DEFAULT 'member',
+	pending_link_client_id BIGINT NOT NULL DEFAULT 0,
 	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_members_ws ON members(workspace_id);
+ALTER TABLE members ADD COLUMN IF NOT EXISTS pending_link_client_id BIGINT NOT NULL DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS clients (
 	id BIGSERIAL PRIMARY KEY,
@@ -215,12 +219,15 @@ CREATE TABLE IF NOT EXISTS clients (
 	phone TEXT NOT NULL DEFAULT '',
 	address TEXT NOT NULL DEFAULT '',
 	description TEXT NOT NULL DEFAULT '',
+	max_user_id BIGINT NOT NULL DEFAULT 0,
 	max_username TEXT NOT NULL DEFAULT '',
 	tags TEXT[] NOT NULL DEFAULT '{}',
 	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 	updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_clients_ws ON clients(workspace_id);
+ALTER TABLE clients ADD COLUMN IF NOT EXISTS max_user_id BIGINT NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS idx_clients_max_user ON clients(workspace_id, max_user_id);
 
 CREATE TABLE IF NOT EXISTS client_notes (
 	id BIGSERIAL PRIMARY KEY,
@@ -311,12 +318,12 @@ func randomCode() string {
 }
 
 const memberSelect = `m.max_user_id, m.workspace_id, w.name, w.invite_code, m.chat_id,
-	m.first_name, m.last_name, m.username, m.role, m.created_at`
+	m.first_name, m.last_name, m.username, m.role, m.pending_link_client_id, m.created_at`
 
 func scanMember(row scanner) (*Member, error) {
 	var m Member
 	if err := row.Scan(&m.MaxUserID, &m.WorkspaceID, &m.WorkspaceName, &m.InviteCode, &m.ChatID,
-		&m.FirstName, &m.LastName, &m.Username, &m.Role, &m.CreatedAt); err != nil {
+		&m.FirstName, &m.LastName, &m.Username, &m.Role, &m.PendingLinkClientID, &m.CreatedAt); err != nil {
 		return nil, err
 	}
 	return &m, nil
@@ -405,6 +412,11 @@ func (s *Store) UpdateMemberChat(ctx context.Context, maxUserID, chatID int64) e
 	return err
 }
 
+func (s *Store) SetMemberPendingLinkClient(ctx context.Context, maxUserID, clientID int64) error {
+	_, err := s.pool.Exec(ctx, `UPDATE members SET pending_link_client_id = $2 WHERE max_user_id = $1`, maxUserID, clientID)
+	return err
+}
+
 // RemoveMember removes a non-owner member of the workspace.
 func (s *Store) RemoveMember(ctx context.Context, workspaceID, maxUserID int64) error {
 	tag, err := s.pool.Exec(ctx, `DELETE FROM members WHERE workspace_id = $1 AND max_user_id = $2 AND role <> 'owner'`,
@@ -421,7 +433,7 @@ func (s *Store) RemoveMember(ctx context.Context, workspaceID, maxUserID int64) 
 // ---------- Clients ----------
 
 const clientSelect = `
-	SELECT c.id, c.workspace_id, c.name, c.phone, c.address, c.description, c.max_username, c.tags,
+	SELECT c.id, c.workspace_id, c.name, c.phone, c.address, c.description, c.max_user_id, c.max_username, c.tags,
 	       c.created_at, c.updated_at,
 	       ao.id, ao.status, ao.cake_description, ao.weight_kg, ao.price, ao.delivery_date,
 	       COALESCE(st.cnt, 0), COALESCE(st.total, 0)
@@ -447,7 +459,7 @@ func scanClient(row scanner) (Client, error) {
 	var aoWeight, aoPrice *float64
 	var aoDate *time.Time
 	if err := row.Scan(
-		&c.ID, &c.WorkspaceID, &c.Name, &c.Phone, &c.Address, &c.Description, &c.MaxUsername, &c.Tags,
+		&c.ID, &c.WorkspaceID, &c.Name, &c.Phone, &c.Address, &c.Description, &c.MaxUserID, &c.MaxUsername, &c.Tags,
 		&c.CreatedAt, &c.UpdatedAt,
 		&aoID, &aoStatus, &aoDesc, &aoWeight, &aoPrice, &aoDate,
 		&c.OrdersCount, &c.TotalSpent,
@@ -519,9 +531,9 @@ func (s *Store) CreateClient(ctx context.Context, workspaceID int64, c Client) (
 	}
 	var id int64
 	err := s.pool.QueryRow(ctx, `
-		INSERT INTO clients (workspace_id, name, phone, address, description, max_username, tags)
-		VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
-		workspaceID, c.Name, c.Phone, c.Address, c.Description, c.MaxUsername, c.Tags).Scan(&id)
+		INSERT INTO clients (workspace_id, name, phone, address, description, max_user_id, max_username, tags)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
+		workspaceID, c.Name, c.Phone, c.Address, c.Description, c.MaxUserID, c.MaxUsername, c.Tags).Scan(&id)
 	if err != nil {
 		return nil, err
 	}
@@ -534,9 +546,11 @@ func (s *Store) UpdateClient(ctx context.Context, workspaceID, id int64, c Clien
 	}
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE clients SET name = $3, phone = $4, address = $5, description = $6,
-		       max_username = $7, tags = $8, updated_at = NOW()
+		       max_username = $7, tags = $8,
+		       max_user_id = CASE WHEN $9::bigint > 0 THEN $9::bigint ELSE max_user_id END,
+		       updated_at = NOW()
 		WHERE workspace_id = $1 AND id = $2`,
-		workspaceID, id, c.Name, c.Phone, c.Address, c.Description, c.MaxUsername, c.Tags)
+		workspaceID, id, c.Name, c.Phone, c.Address, c.Description, c.MaxUsername, c.Tags, c.MaxUserID)
 	if err != nil {
 		return nil, err
 	}
@@ -544,6 +558,144 @@ func (s *Store) UpdateClient(ctx context.Context, workspaceID, id int64, c Clien
 		return nil, ErrNotFound
 	}
 	return s.GetClient(ctx, workspaceID, id)
+}
+
+func normalizePhoneDigits(p string) string {
+	var b strings.Builder
+	for _, r := range p {
+		if r >= '0' && r <= '9' {
+			b.WriteRune(r)
+		}
+	}
+	d := b.String()
+	if len(d) == 11 && d[0] == '8' {
+		d = "7" + d[1:]
+	}
+	return d
+}
+
+// FindClientByMaxOrPhone looks up an existing client in the workspace by MAX user ID, @username, or phone digits.
+func (s *Store) FindClientByMaxOrPhone(ctx context.Context, workspaceID, maxUserID int64, username, phone string) (*Client, error) {
+	if maxUserID > 0 {
+		c, err := scanClient(s.pool.QueryRow(ctx, clientSelect+` WHERE c.workspace_id = $1 AND c.max_user_id = $2 LIMIT 1`, workspaceID, maxUserID))
+		if err == nil {
+			return &c, nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return nil, err
+		}
+	}
+
+	u := strings.TrimPrefix(strings.TrimSpace(username), "@")
+	if u != "" {
+		c, err := scanClient(s.pool.QueryRow(ctx, clientSelect+` WHERE c.workspace_id = $1 AND lower(c.max_username) = lower($2) LIMIT 1`, workspaceID, u))
+		if err == nil {
+			return &c, nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return nil, err
+		}
+	}
+
+	digits := normalizePhoneDigits(phone)
+	if len(digits) >= 7 {
+		// Compare last 10 digits so +7 / 8 / formatting differences match reliably.
+		tail := digits
+		if len(tail) > 10 {
+			tail = tail[len(tail)-10:]
+		}
+		c, err := scanClient(s.pool.QueryRow(ctx, clientSelect+`
+			WHERE c.workspace_id = $1
+			  AND regexp_replace(c.phone, '[^0-9]', '', 'g') LIKE '%' || $2
+			LIMIT 1`, workspaceID, tail))
+		if err == nil {
+			return &c, nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return nil, err
+		}
+	}
+
+	return nil, nil
+}
+
+// LinkClientMaxContact binds MAX contact details to an existing client, filling empty phone/name fields if needed.
+func (s *Store) LinkClientMaxContact(ctx context.Context, workspaceID, clientID, maxUserID int64, maxUsername, phone, fallbackName string) (*Client, error) {
+	u := strings.TrimPrefix(strings.TrimSpace(maxUsername), "@")
+	ph := strings.TrimSpace(phone)
+	nm := strings.TrimSpace(fallbackName)
+
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE clients
+		SET max_user_id = CASE WHEN $3::bigint > 0 THEN $3::bigint ELSE max_user_id END,
+		    max_username = CASE WHEN $4 <> '' THEN $4 ELSE max_username END,
+		    phone = CASE WHEN phone = '' AND $5 <> '' THEN $5 ELSE phone END,
+		    name = CASE WHEN name = '' AND $6 <> '' THEN $6 ELSE name END,
+		    updated_at = NOW()
+		WHERE workspace_id = $1 AND id = $2`,
+		workspaceID, clientID, maxUserID, u, ph, nm)
+	if err != nil {
+		return nil, err
+	}
+	if tag.RowsAffected() == 0 {
+		return nil, ErrNotFound
+	}
+	return s.GetClient(ctx, workspaceID, clientID)
+}
+
+// UnlinkClientMaxContact clears MAX binding fields on a client.
+func (s *Store) UnlinkClientMaxContact(ctx context.Context, workspaceID, clientID int64) (*Client, error) {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE clients SET max_user_id = 0, max_username = '', updated_at = NOW()
+		WHERE workspace_id = $1 AND id = $2`,
+		workspaceID, clientID)
+	if err != nil {
+		return nil, err
+	}
+	if tag.RowsAffected() == 0 {
+		return nil, ErrNotFound
+	}
+	return s.GetClient(ctx, workspaceID, clientID)
+}
+
+// MergeClientContactInto copies contact details (and any notes/orders) from sourceClientID into targetClientID and deletes sourceClientID.
+func (s *Store) MergeClientContactInto(ctx context.Context, workspaceID, sourceClientID, targetClientID int64) (*Client, error) {
+	if sourceClientID == targetClientID {
+		return s.GetClient(ctx, workspaceID, targetClientID)
+	}
+	src, err := s.GetClient(ctx, workspaceID, sourceClientID)
+	if err != nil {
+		return nil, err
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx, `UPDATE orders SET client_id = $3 WHERE workspace_id = $1 AND client_id = $2`, workspaceID, sourceClientID, targetClientID); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE client_notes SET client_id = $3 WHERE workspace_id = $1 AND client_id = $2`, workspaceID, sourceClientID, targetClientID); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE clients
+		SET max_user_id = CASE WHEN $3::bigint > 0 THEN $3::bigint ELSE max_user_id END,
+		    max_username = CASE WHEN $4 <> '' THEN $4 ELSE max_username END,
+		    phone = CASE WHEN phone = '' AND $5 <> '' THEN $5 ELSE phone END,
+		    updated_at = NOW()
+		WHERE workspace_id = $1 AND id = $2`,
+		workspaceID, targetClientID, src.MaxUserID, src.MaxUsername, src.Phone); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM clients WHERE workspace_id = $1 AND id = $2`, workspaceID, sourceClientID); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return s.GetClient(ctx, workspaceID, targetClientID)
 }
 
 func (s *Store) DeleteClient(ctx context.Context, workspaceID, id int64) error {

@@ -150,10 +150,18 @@ type RawCallback struct {
 }
 
 type RawMessage struct {
-	Sender    *RawUser       `json:"sender"`
-	Recipient RawRecipient   `json:"recipient"`
-	Timestamp int64          `json:"timestamp"`
-	Body      RawMessageBody `json:"body"`
+	Sender    *RawUser          `json:"sender"`
+	Recipient RawRecipient      `json:"recipient"`
+	Timestamp int64             `json:"timestamp"`
+	Link      *RawLinkedMessage `json:"link"`
+	Body      RawMessageBody    `json:"body"`
+}
+
+type RawLinkedMessage struct {
+	Type    string         `json:"type"` // "forward" | "reply"
+	Sender  *RawUser       `json:"sender"`
+	ChatID  int64          `json:"chat_id"`
+	Message RawMessageBody `json:"message"`
 }
 
 type RawRecipient struct {
@@ -416,12 +424,23 @@ func (c *Client) VerifyContactHash(vcfInfo, hash string) bool {
 	return subtle.ConstantTimeCompare([]byte(computed), []byte(hash)) == 1
 }
 
-var vcfTelRegex = regexp.MustCompile(`(?i)TEL[^:]*:([+\d\s\-()]+)`)
+var (
+	vcfTelRegex = regexp.MustCompile(`(?i)TEL[^:]*:([+\d\s\-()]+)`)
+	vcfFNRegex  = regexp.MustCompile(`(?im)^FN[^:]*:(.+)$`)
+)
 
 func ExtractPhoneFromVCF(vcf string) string {
 	matches := vcfTelRegex.FindStringSubmatch(vcf)
 	if len(matches) >= 2 {
 		return strings.TrimSpace(matches[1])
+	}
+	return ""
+}
+
+func ExtractNameFromVCF(vcf string) string {
+	matches := vcfFNRegex.FindStringSubmatch(vcf)
+	if len(matches) >= 2 {
+		return strings.TrimSpace(strings.ReplaceAll(matches[1], "\r", ""))
 	}
 	return ""
 }

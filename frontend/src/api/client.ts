@@ -78,6 +78,11 @@ export const api = {
 
   deleteClient: (id: number) => request<{ deleted: boolean }>('DELETE', `/api/clients/${id}`),
 
+  requestClientMaxLink: (id: number) =>
+    request<{ ok: boolean; bot_url: string }>('POST', `/api/clients/${id}/request-link`),
+
+  unlinkClientMax: (id: number) => request<Client>('DELETE', `/api/clients/${id}/link`),
+
   addNote: (clientId: number, text: string) =>
     request<Note>('POST', `/api/clients/${clientId}/notes`, { text }),
 

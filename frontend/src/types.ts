@@ -13,6 +13,7 @@ export interface Client {
   phone: string;
   address: string;
   description: string;
+  max_user_id: number;
   max_username: string;
   tags: string[];
   created_at: string;
@@ -27,6 +28,7 @@ export interface ClientInput {
   phone: string;
   address: string;
   description: string;
+  max_user_id?: number;
   max_username: string;
   tags: string[];
 }

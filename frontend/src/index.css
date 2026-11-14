@@ -1648,6 +1648,37 @@ body,
   word-break: break-all;
 }
 
+.max-linked-pill {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 6px;
+  font-size: 10px;
+  font-weight: 700;
+  color: #1d4ed8;
+  background: #dbeafe;
+  border-radius: 99px;
+  vertical-align: middle;
+}
+
+.max-link-banner {
+  padding: 10px 12px;
+  border-radius: 10px;
+  font-size: 13px;
+  margin-bottom: 12px;
+}
+
+.max-link-banner.linked {
+  background: #ecfdf5;
+  border: 1px solid #a7f3d0;
+  color: #065f46;
+}
+
+.max-link-banner.pending {
+  background: #eff6ff;
+  border: 1px solid #bfdbfe;
+  color: #1e3a8a;
+}
+
 @media (max-width: 960px) {
   .topbar {
     flex-direction: column;
